@@ -27,6 +27,8 @@ DEFAULT_MODELS = [
     "xgboost",
     "lstm",
     "patchtst",
+    "cnn_candle",
+    "cnn_gaf",
 ]
 
 

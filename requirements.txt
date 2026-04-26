@@ -38,3 +38,9 @@ scipy==1.13.1               # Diebold-Mariano (Student-t CDF) + general numerics
 # Deep learning baselines (LSTM, PatchTST)
 # CPU build is fine for Phase 2; switch to a CUDA wheel if you have a GPU.
 torch==2.4.1
+
+# =============================================================================
+#  Phase 3 — Chart-CNN (vision)
+# =============================================================================
+pillow==10.4.0              # PNG IO for sample/Grad-CAM previews
+torchvision==0.19.1         # tensor transforms (mostly used downstream in Phase 6)

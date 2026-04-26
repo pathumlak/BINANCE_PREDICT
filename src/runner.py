@@ -27,6 +27,7 @@ from src.eval.metrics import aggregate_folds, evaluate_fold, FoldMetrics
 from src.eval.walk_forward import auto_config, walk_forward_splits
 from src.features.dataset import Dataset, build_dataset
 from src.models.base import Baseline
+from src.models.baseline_cnn import CNNCandlestick, CNNGafMtf
 from src.models.baseline_lstm import LSTMBaseline
 from src.models.baseline_naive import MajorityClass, Persistence, RandomCoin
 from src.models.baseline_patchtst import PatchTSTBaseline
@@ -41,6 +42,8 @@ MODEL_REGISTRY: dict[str, Callable[[], Baseline]] = {
     "xgboost":          lambda: XGBoostBaseline(),
     "lstm":             lambda: LSTMBaseline(),
     "patchtst":         lambda: PatchTSTBaseline(),
+    "cnn_candle":       lambda: CNNCandlestick(),
+    "cnn_gaf":          lambda: CNNGafMtf(),
 }
 
 
@@ -77,6 +80,10 @@ def run_one(model_name: str, pair: str, interval: str,
         nr_te = next_ret.iloc[te_idx].fillna(0.0).to_numpy()
 
         model = MODEL_REGISTRY[model_name]()
+        # CNN baselines need the (pair, interval) context to load OHLCV
+        # for image generation. attach_context is a no-op on others.
+        if hasattr(model, "attach_context"):
+            model.attach_context(pair, interval)
         model.fit(X_tr, y_tr)
         prob = model.predict_proba(X_te)
         pred = (prob >= 0.5).astype(int)
