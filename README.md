@@ -301,10 +301,116 @@ signed-p-value matrix per pair (negative p ⇒ row beats column;
 * If `xgboost < naive_majority`, your dataset has a near-pure label imbalance and the model is doing nothing. Check `y.mean()`.
 * If `lstm == patchtst == 0.5`, training collapsed (often: features all NaN after standardise, or windowing produced empty arrays). Inspect `_LSTMNet.forward` / `_PatchEmbed` shapes.
 
-## What's next — Phase 3 preview
+# Phase 3 — Chart-CNN
 
-Phase 3 introduces the chart-CNN: render candlestick windows as images,
-train a small ResNet/EfficientNet head, learn embeddings reusable in
-Phase 6's pattern-matching engine. The CNN's predictions plug into the
-same evaluation harness built here, so we can DM-test it directly
+Phase 3 adds two vision baselines that operate on chart images instead of
+engineered numerical features. Both reuse Phase 2's walk-forward CV
+harness and metric pipeline so their predictions are directly DM-testable
 against XGBoost / LSTM / PatchTST.
+
+## What's new
+
+* **Two image encoders** (`src/vision/encoders/`)
+  * `candlestick.py` — direct numpy raster of OHLC candles into a 3-channel RGB image. No matplotlib round-trip.
+  * `gaf_mtf.py` — Gramian Angular Summation Field + Gramian Angular Difference Field + Markov Transition Field of the close-price window, stacked as 3 channels. (Wang & Oates 2015, Sezer & Ozbayoglu 2018.)
+* **Compact CNN** (`src/vision/cnn.py`) — ~250K-param 4-block conv net with separate 128-d embedding and binary classification heads. The embedding head is what Phase 6's pattern matcher will index in FAISS.
+* **PyTorch dataset** (`src/vision/dataset.py`) — slides the window with stride-tricks, encodes lazily in `__getitem__`, exposes `(image, label)` aligned by `open_time` to Phase 2's labels.
+* **Trainer** (`src/vision/trainer.py`) — per-channel mean/std fit on the training window only; AdamW + early stopping on a 10% chronological tail.
+* **Grad-CAM** (`src/vision/gradcam.py`) — class-activation map over the last conv block + RGB overlay helper for thesis figures.
+* **Two `Baseline` adapters** (`src/models/baseline_cnn.py`) — `CNNCandlestick`, `CNNGafMtf` — implement the same `fit` / `predict_proba` interface as Phase 2 baselines so the runner just iterates them.
+
+## Layout
+
+```
+src/
+├── vision/
+│   ├── encoders/
+│   │   ├── candlestick.py    # render_candlestick(ohlc, hw) → (3, hw, hw) uint8
+│   │   └── gaf_mtf.py        # render_gaf_mtf(close, size) → (3, size, size) float32
+│   ├── cnn.py                # ChartCNN(in_channels=3, emb_dim=128)
+│   ├── dataset.py            # ChartImageDataset + make_datasets_for_pair
+│   ├── trainer.py            # train_cnn_on_indices, predict_probabilities
+│   └── gradcam.py            # GradCAM, overlay_on_image
+└── models/
+    └── baseline_cnn.py       # CNNCandlestick, CNNGafMtf
+
+scripts/
+├── smoke_phase3.py           # 1 fold + sample image + Grad-CAM (~2 min)
+└── preview_cnn.py            # dump N preview images per (pair, encoder)
+```
+
+## Setup (additional deps)
+
+```bash
+pip install -r requirements.txt   # adds pillow, torchvision
+```
+
+## Smoke test (always run first)
+
+```bash
+python scripts/smoke_phase3.py                 # candle encoder
+python scripts/smoke_phase3.py --encoder gaf   # GAF/MTF encoder
+```
+
+Should write a sample image and a Grad-CAM overlay under
+`experiments/smoke_phase3/` and end with `smoke OK`.
+
+Eyeball the saved images — for the candlestick encoder you should see
+recognisable candles (green/red bodies, wicks). For GAF, you'll see a
+symmetric matrix-style pattern (it's a Gramian field, not a chart).
+Grad-CAM overlays should highlight a small region rather than the whole
+image (a uniformly hot heatmap usually means the model collapsed).
+
+## Full run
+
+The CNN baselines are already in `train_baselines.py`'s default model
+list, so the existing sweep command picks them up:
+
+```bash
+python scripts/train_baselines.py --models cnn_candle cnn_gaf
+```
+
+Budget: roughly 15–25 minutes per (pair × CNN model) on CPU for our
+75K-row 1h datasets. Total for both encoders × 5 pairs ≈ 2–3 hours.
+Cut training time by passing `--folds 4` or focusing on `--pairs BTCUSDT ETHUSDT`.
+
+## Re-summarise after the CNN finishes
+
+```bash
+python scripts/summarize_baselines.py
+python scripts/summarize_baselines.py --pair BTCUSDT
+```
+
+The Diebold-Mariano matrix will now include `cnn_candle` and `cnn_gaf`.
+The interesting cells are CNN vs XGBoost (the toughest baseline).
+
+## What to expect
+
+CNNs on chart images alone are *not* expected to beat XGBoost on
+numerical features — published crypto-prediction work (Sezer & Ozbayoglu
+2018, Livieris et al. 2020) shows them roughly tied with strong tabular
+baselines. If you see the CNN within ±1% accuracy of XGBoost, that's
+the textbook result and supports the thesis premise: **vision adds
+*orthogonal* information rather than replacing numerical features**, which
+is what motivates the multimodal fusion in Phase 5.
+
+## Sanity rules of thumb (Phase 3 specific)
+
+* If `cnn_candle` accuracy > 0.60, suspect a leak first (probably the
+  window definition includes the label candle). Recheck `_build_windows`
+  in `vision/dataset.py` — the window must end at the candle whose
+  *next-bar direction* is the label.
+* If `cnn_gaf` predicts a constant (acc ≈ class prior), the GAF channels
+  collapsed to flat values — usually because the input window is too
+  short for `np.quantile` to bin meaningfully. Increase `--window`.
+* If Grad-CAM looks uniformly hot, the model is undertrained or BatchNorm
+  has collapsed. Increase epochs or check that early stopping isn't
+  killing it after 2–3 epochs.
+
+## What's next — Phase 4 preview
+
+Phase 4 adds the news / sentiment pipeline that Phase 1 already
+ingests data for: load articles, run FinBERT/CryptoBERT, align by
+publication timestamp (no leak!), aggregate to per-bar sentiment vectors.
+Phase 5 then fuses {numerical, image-embedding, sentiment} into one
+multimodal classifier with conformal uncertainty.
