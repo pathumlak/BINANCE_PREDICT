@@ -1,0 +1,79 @@
+# =============================================================================
+#  Phase 1 — Data Ingestion Configuration
+# =============================================================================
+# Edit this file to change which pairs / intervals / sources are pulled.
+# The downloader scripts read this at startup.
+
+# --- Binance OHLCV ---
+binance:
+  # Top 5 majors vs USDT (per Phase 1 scope decision)
+  pairs:
+    - BTCUSDT
+    - ETHUSDT
+    - BNBUSDT
+    - SOLUSDT
+    - XRPUSDT
+
+  # Candle intervals to store. Match Binance API symbols exactly.
+  intervals:
+    - 1m
+    - 5m
+    - 15m
+    - 1h
+    - 4h
+    - 1d
+
+  # "max" pulls from the pair's listing date on Binance (recommended).
+  # Or set an ISO date like "2020-01-01" to bound the fetch.
+  history_start: max
+
+  # Politeness on the public REST endpoint. Binance allows ~1200 weight/min;
+  # each kline request = 1 weight, so 10 req/s is well under the limit.
+  rest:
+    requests_per_second: 8
+    page_size: 1000          # max candles per /klines request
+    max_retries: 5
+
+  # WebSocket live streamer
+  websocket:
+    # Only persist closed candles (avoid intra-candle noise in the dataset).
+    only_closed: true
+    # Reconnect backoff seconds (exponential, capped).
+    reconnect_initial: 1
+    reconnect_max: 60
+
+# --- News & sentiment sources ---
+news:
+  # Free public sources. Add API keys in .env to unlock paid feeds later.
+  rss_feeds:
+    - name: CoinDesk
+      url: https://www.coindesk.com/arc/outboundfeeds/rss/
+    - name: CoinTelegraph
+      url: https://cointelegraph.com/rss
+    - name: Decrypt
+      url: https://decrypt.co/feed
+    - name: Bitcoin Magazine
+      url: https://bitcoinmagazine.com/.rss/full/
+  cryptopanic:
+    # Public endpoint requires no key but is rate-limited (~5 req/min).
+    # Add CRYPTOPANIC_API_KEY to .env to lift the limit.
+    enabled: true
+    base_url: https://cryptopanic.com/api/v1/posts/
+    poll_interval_seconds: 120
+    currencies:               # filter to our tracked majors
+      - BTC
+      - ETH
+      - BNB
+      - SOL
+      - XRP
+
+# --- Storage ---
+storage:
+  # Root directory for all Parquet output. Resolved relative to project root.
+  root: data
+  # Partition scheme for OHLCV: data/ohlcv/<PAIR>/<INTERVAL>/<YYYY-MM>.parquet
+  ohlcv_partition: monthly
+  # News stored as data/news/<source>/<YYYY-MM-DD>.parquet
+  news_partition: daily
+  # Compression codec (snappy = fast, zstd = smaller). Stick with snappy for now.
+  compression: snappy

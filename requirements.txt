@@ -1,0 +1,40 @@
+# =============================================================================
+#  Phase 1 — Data Ingestion dependencies
+# =============================================================================
+# Pin minor versions to keep research reproducible.
+
+# Binance API
+python-binance==1.0.19      # REST + WebSocket client
+websocket-client==1.8.0     # raw WebSocketApp used in src/ingest/live.py
+requests==2.32.3            # raw REST fallback / health checks
+
+# Data handling
+pandas==2.2.2
+pyarrow==17.0.0             # Parquet engine
+numpy==1.26.4
+
+# News scraping
+feedparser==6.0.11          # RSS feeds (CoinDesk, CoinTelegraph)
+beautifulsoup4==4.12.3      # HTML cleaning of article snippets
+
+# Config + logging
+pyyaml==6.0.2
+python-dotenv==1.0.1
+loguru==0.7.2               # nicer log formatting than stdlib
+
+# Convenience
+tqdm==4.66.5                # progress bars for long historical pulls
+tenacity==9.0.0             # retry decorator with backoff
+
+# =============================================================================
+#  Phase 2 — Feature engineering, baselines, evaluation
+# =============================================================================
+
+# Classical ML
+scikit-learn==1.5.2         # metrics + preprocessing utilities
+xgboost==2.1.1              # tabular baseline
+scipy==1.13.1               # Diebold-Mariano (Student-t CDF) + general numerics
+
+# Deep learning baselines (LSTM, PatchTST)
+# CPU build is fine for Phase 2; switch to a CUDA wheel if you have a GPU.
+torch==2.4.1
