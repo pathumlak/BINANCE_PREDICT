@@ -44,3 +44,10 @@ torch==2.4.1
 # =============================================================================
 pillow==10.4.0              # PNG IO for sample/Grad-CAM previews
 torchvision==0.19.1         # tensor transforms (mostly used downstream in Phase 6)
+
+# =============================================================================
+#  Phase 4 — News & sentiment NLP
+# =============================================================================
+transformers==4.44.2        # CryptoBERT + FinBERT pipelines
+sentencepiece==0.2.0        # tokenizer dependency for some BERT variants
+safetensors==0.4.5          # weight loading format used by both models

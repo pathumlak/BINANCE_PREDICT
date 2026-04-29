@@ -126,8 +126,21 @@ def fetch_cryptopanic_page(cfg: Config, page: int = 1) -> dict:
         "currencies": ",".join(cfg.news.cryptopanic.currencies),
         "page": page,
     }
-    if cfg.cryptopanic_api_key:
-        params["auth_token"] = cfg.cryptopanic_api_key
+    # Guard against the docs-placeholder URL accidentally being pasted into
+    # .env (a 32-char hex key never starts with http://, contains slashes,
+    # or contains "<" / ">" template markers).
+    key = (cfg.cryptopanic_api_key or "").strip()
+    looks_legit = key and not (
+        key.startswith(("http://", "https://"))
+        or "/" in key
+        or "<" in key or ">" in key
+    )
+    if looks_legit:
+        params["auth_token"] = key
+    elif key:
+        logger.warning(
+            "CRYPTOPANIC_API_KEY looks like a URL/template, not an API key — ignoring."
+        )
     resp = requests.get(cfg.news.cryptopanic.base_url, params=params, timeout=15)
     resp.raise_for_status()
     return resp.json()

@@ -44,7 +44,9 @@ binance:
 
 # --- News & sentiment sources ---
 news:
-  # Free public sources. Add API keys in .env to unlock paid feeds later.
+  # Free RSS sources. No API keys required.
+  # We expanded the list after CryptoPanic discontinued their free tier
+  # (April 2026) so RSS volume covers the gap.
   rss_feeds:
     - name: CoinDesk
       url: https://www.coindesk.com/arc/outboundfeeds/rss/
@@ -54,13 +56,26 @@ news:
       url: https://decrypt.co/feed
     - name: Bitcoin Magazine
       url: https://bitcoinmagazine.com/.rss/full/
+    # Added April 2026 to compensate for CryptoPanic free-tier shutdown
+    - name: The Block
+      url: https://www.theblock.co/rss.xml
+    - name: CryptoSlate
+      url: https://cryptoslate.com/feed/
+    - name: NewsBTC
+      url: https://www.newsbtc.com/feed/
+    - name: Bitcoinist
+      url: https://bitcoinist.com/feed/
+    - name: U.Today
+      url: https://u.today/rss
+    - name: Reddit CryptoCurrency
+      url: https://www.reddit.com/r/CryptoCurrency/.rss
   cryptopanic:
-    # Public endpoint requires no key but is rate-limited (~5 req/min).
-    # Add CRYPTOPANIC_API_KEY to .env to lift the limit.
-    enabled: true
+    # CryptoPanic's free Developer API was discontinued on 2026-04-01.
+    # Set enabled: true and add a paid CRYPTOPANIC_API_KEY in .env to use.
+    enabled: false
     base_url: https://cryptopanic.com/api/v1/posts/
     poll_interval_seconds: 120
-    currencies:               # filter to our tracked majors
+    currencies:
       - BTC
       - ETH
       - BNB

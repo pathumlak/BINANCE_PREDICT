@@ -407,10 +407,111 @@ is what motivates the multimodal fusion in Phase 5.
   has collapsed. Increase epochs or check that early stopping isn't
   killing it after 2–3 epochs.
 
-## What's next — Phase 4 preview
+# Phase 4 — News & Sentiment NLP
 
-Phase 4 adds the news / sentiment pipeline that Phase 1 already
-ingests data for: load articles, run FinBERT/CryptoBERT, align by
-publication timestamp (no leak!), aggregate to per-bar sentiment vectors.
-Phase 5 then fuses {numerical, image-embedding, sentiment} into one
-multimodal classifier with conformal uncertainty.
+Phase 4 adds the textual modality. The Phase 1 ingestion pipeline already
+fills `data/news/` with RSS + CryptoPanic articles, each carrying both
+`published_at` and `ingested_at`. Phase 4 scores those articles with a
+**CryptoBERT + FinBERT ensemble**, aggregates the scores into per-1h-bar
+sentiment vectors, and ships a sentiment-only toy baseline so we can DM
+the textual signal in isolation before fusing it in Phase 5.
+
+## What's new
+
+* **Sentiment ensemble** (`src/nlp/sentiment.py`) — lazy-loading wrapper
+  around `ElKulako/cryptobert` + `ProsusAI/finbert`. Returns per-model
+  scores in `[-1, +1]` plus a calibrated ensemble + confidence.
+* **Batch scoring** (`src/nlp/scoring.py`, `scripts/score_news.py`) —
+  walks every news Parquet, scores unscored rows, persists in place.
+  Resumable: re-runs only score newly-arrived articles.
+* **Per-bar aggregator** (`src/nlp/aggregate.py`,
+  `scripts/build_sentiment_features.py`) — collapses scored articles
+  into 7 per-bar features (`sent_count / mean / std / min / max / last /
+  conf_mean`) over a 24-hour rolling window.
+* **Leakage guards** (`src/nlp/leakage.py`) — invariant checks:
+  `published_at <= ingested_at` for every article and `< bar_open_time`
+  for every aggregated row.
+* **Sentiment-only baseline** (`src/models/baseline_sentiment.py`) —
+  L2-regularised logistic regression on the 7 sentiment features. Only
+  evaluates on bars that actually had at least one article in their
+  lookback window.
+
+## Forward-only news
+
+A deliberate choice: RSS / CryptoPanic don't backfill, so news data only
+grows from "now" forward. The sentiment baseline therefore evaluates on
+the **overlap window** between (a) where news has accumulated and (b)
+where you have OHLCV. That's typically just a few weeks at first; the
+baseline gets stronger every day the live news streamer keeps running.
+
+For full thesis-grade results, leave `python scripts/fetch_news.py
+--loop` running for at least 4–8 weeks before claiming sentiment
+contributes.
+
+## Layout
+
+```
+src/
+└── nlp/
+    ├── sentiment.py       # CryptoBERT + FinBERT ensemble
+    ├── scoring.py         # batch-score every news Parquet (resumable)
+    ├── aggregate.py       # per-bar sentiment vectors
+    └── leakage.py         # invariant guards
+src/models/
+└── baseline_sentiment.py  # logistic-reg toy baseline
+
+scripts/
+├── score_news.py
+├── build_sentiment_features.py
+└── smoke_phase4.py
+```
+
+## Setup (additional deps)
+
+```bash
+pip install -r requirements.txt   # adds transformers, sentencepiece, safetensors
+```
+
+First run will download ~880 MB of model weights (CryptoBERT ~440 MB,
+FinBERT ~440 MB). They're cached under `~/.cache/huggingface/`.
+
+## Usage
+
+```bash
+# 1. Keep the news streamer running in a sidecar terminal
+python scripts/fetch_news.py --loop
+
+# 2. Score whatever news has arrived so far
+python scripts/score_news.py
+
+# 3. Build per-1h-bar sentiment feature parquet
+python scripts/build_sentiment_features.py --pairs BTCUSDT ETHUSDT --interval 1h
+
+# 4. Smoke test the full chain
+python scripts/smoke_phase4.py
+```
+
+The smoke test scores five hand-picked headlines, asserts the no-leak
+invariant on whatever news is on disk, then aggregates per-bar features
+for BTCUSDT. Should print `smoke phase 4 OK` at the end.
+
+## Sanity rules of thumb (Phase 4 specific)
+
+* **`sent_count == 0` for most bars** is normal — news is sparse on a
+  1-hour grid. The aggregator returns zeros for empty windows, which the
+  baseline drops via `sent_count > 0`.
+* **Both backbones disagreeing** (large `|cb - fb|`) is *interesting*,
+  not bad. CryptoBERT often picks up bullish slang FinBERT misses.
+* **`assert_news_publication_before_ingest` fails** → check the source's
+  RSS feed clock. Sometimes feeds publish into the future by minutes.
+  Fix at ingestion-time (clamp `published_at = min(published_at,
+  ingested_at)`), don't paper over here.
+
+## What's next — Phase 5 preview
+
+Phase 5 is the headline contribution: a late-fusion multimodal
+classifier that combines (numerical features, chart-CNN embeddings,
+sentiment vectors), wrapped in conformal prediction so every output
+ships with a calibrated 90% confidence interval. The Diebold-Mariano
+test from Phase 2 will quantify whether each modality adds significant
+information over the ones beneath it.
