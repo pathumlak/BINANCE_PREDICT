@@ -1,0 +1,5 @@
+variant,pair,cnn_candle,cnn_gaf,lstm,naive_majority,naive_persistence,patchtst,xgboost
+fusion_num,BTCUSDT,0.2018,-0.0883,-0.1887,-0.0,-0.0,-0.0026,-0.0946
+fusion_num_cnn,BTCUSDT,-0.0007,-0.0,-0.0,-0.0,-0.0,-0.0,-0.0
+fusion_num_cnn_sent,BTCUSDT,-0.0007,-0.0,-0.0,-0.0,-0.0,-0.0,-0.0
+fusion_num_sent,BTCUSDT,0.2018,-0.0883,-0.1887,-0.0,-0.0,-0.0026,-0.0946

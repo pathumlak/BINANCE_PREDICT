@@ -507,11 +507,97 @@ for BTCUSDT. Should print `smoke phase 4 OK` at the end.
   Fix at ingestion-time (clamp `published_at = min(published_at,
   ingested_at)`), don't paper over here.
 
-## What's next — Phase 5 preview
+# Phase 5 — Multimodal late-fusion with conformal uncertainty
 
 Phase 5 is the headline contribution: a late-fusion multimodal
 classifier that combines (numerical features, chart-CNN embeddings,
-sentiment vectors), wrapped in conformal prediction so every output
-ships with a calibrated 90% confidence interval. The Diebold-Mariano
-test from Phase 2 will quantify whether each modality adds significant
+sentiment vectors), wrapped in inductive conformal prediction so every
+output ships with a calibrated 90 % prediction set. The Diebold-Mariano
+test from Phase 2 quantifies whether each modality adds significant
 information over the ones beneath it.
+
+## What's new
+
+* **Fusion baseline** (`src/models/baseline_fusion.py`) — concatenates the
+  three modality blocks into one per-bar feature vector, standardises on
+  the train slice, fits L2-regularised logistic regression, and wraps it
+  in an inductive (split) conformal classifier calibrated on the last
+  20 % of the train window.
+* **Ablation runner** (`scripts/train_fusion.py`) — runs four variants
+  per pair so each modality's contribution is isolated:
+  `fusion_num`, `fusion_num_cnn`, `fusion_num_sent`, `fusion_num_cnn_sent`.
+* **Pre-flight check** — both `train_fusion.py` and `smoke_phase5.py`
+  fail fast with the exact "run this first" command if either CNN
+  embeddings or sentiment features are missing.
+* **Summariser** (`scripts/summarize_fusion.py`) — ranks the fusion
+  variants, reports empirical conformal coverage and average prediction-
+  set size, and DM-tests every variant against every Phase 2 / 3 baseline.
+* **Smoke test** (`scripts/smoke_phase5.py`) — one-fold sanity run that
+  asserts conformal coverage lands near the nominal 0.90 and average set
+  size stays in [1, 2].
+
+## Pre-conditions
+
+The fusion model is downstream of three earlier phases — make sure these
+have produced their artefacts first:
+
+```bash
+# Phase 1 — historical OHLCV must be on disk
+python scripts/fetch_historical.py    # (skip if already done)
+
+# Phase 3 — train CNN + dump 128-d embeddings (slow: ~15-25 min CPU per pair)
+python scripts/extract_chart_embeddings.py --pairs BTCUSDT --interval 1h --encoder candle
+
+# Phase 4 — per-bar sentiment features
+python scripts/score_news.py
+python scripts/build_sentiment_features.py --pairs BTCUSDT --interval 1h
+```
+
+## Smoke test
+
+```bash
+python scripts/smoke_phase5.py
+```
+
+Runs 1 fold of the full-fusion variant on BTCUSDT 1h. Should print
+`smoke phase 5 OK` with empirical coverage near 0.90 and set size in
+[1, 2]. Fast (< 1 min) — logistic regression is cheap.
+
+## Full BTC sweep + summary
+
+```bash
+python scripts/train_fusion.py --pairs BTCUSDT --folds 6
+python scripts/summarize_fusion.py --pair BTCUSDT
+```
+
+Outputs land under `experiments/fusion/BTCUSDT/<variant>/` plus
+`experiments/fusion/summary.csv`, `dm_vs_baselines.csv`, and
+`PHASE5_RESULTS.md`.
+
+## Reading the conformal metrics
+
+| Metric | Meaning | What's good |
+| --- | --- | --- |
+| `cp_coverage` | Empirical fraction of test rows whose true label fell in the conformal set | Should land at **0.90 ± 0.02** under the exchangeability assumption. Drift > 0.05 is a red flag — likely a calibration leak. |
+| `cp_avg_set_size` | Mean prediction-set cardinality, ∈ [1, 2] | Closer to 1 ⇒ the model is confident enough to commit. Stuck at 2.0 ⇒ undertrained or the classes are inseparable on the fusion features. |
+| `cp_singleton_frac` | Fraction of predictions that came out as singletons | Useful for trading — only singletons should drive position-taking. |
+
+## Sanity rules of thumb (Phase 5 specific)
+
+* If `fusion_num_cnn_sent` accuracy < every single-modality baseline,
+  late-fusion is destroying signal — usually because one modality has a
+  scale issue. Inspect `scaler_std` per block and look for near-zero
+  values (these blow up after standardisation).
+* If `cp_coverage` ≈ 0.50, calibration data leaked into fitting — check
+  that `n_cal` rows really do come from the chronological tail.
+* `fusion_num_sent` is expected to be near `fusion_num` on the BTC test
+  window because sentiment is sparse before 4–8 weeks of news
+  accumulation — the value of sentiment shows up later as the news
+  archive grows.
+
+## What's next — Phase 6 preview
+
+Phase 6 builds a FAISS k-NN index over the chart-CNN embeddings already
+emitted in Phase 5's pre-flight step. Combined with HMM-classified market
+regimes (Phase 6 §2), this gives the dashboard (Phase 7) the "show me
+the K most similar historical patterns" feature.
