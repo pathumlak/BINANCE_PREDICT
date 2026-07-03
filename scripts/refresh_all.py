@@ -64,7 +64,7 @@ def _steps(pairs: list[str], interval: str) -> list[Step]:
         Step(
             key="ohlcv",
             description="Phase 1 — fetch/resume historical OHLCV",
-            argv=["scripts/fetch_historical.py", *pairs_flag],
+            argv=["scripts/fetch_historical.py", *pairs_flag, *interval_flag],
         ),
         Step(
             key="news_score",

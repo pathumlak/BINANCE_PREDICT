@@ -160,6 +160,60 @@ def similar(
     )
 
 
+@router.get("/similar/detailed")
+def similar_detailed(
+    req: Request,
+    open_time: str,
+    k: int = Query(5, ge=1, le=20),
+    regime_filter: bool = True,
+) -> dict:
+    """Similar matches enriched with their 64-bar OHLC windows.
+
+    The frontend renders each match as a small candlestick sparkline so
+    the viewer can see the actual historical pattern that the CNN
+    considered similar.
+    """
+    svc = _svc(req)
+    ts = _parse_ts(open_time)
+    try:
+        rows = svc.similar_with_windows(ts, k=k, regime_filter=regime_filter)
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return {
+        "query_open_time": _iso(ts),
+        "k": k,
+        "regime_filter": regime_filter,
+        "matches": [
+            {
+                "open_time": _iso(m["open_time"]),
+                "similarity": float(m["similarity"]),
+                "regime": m["regime"],
+                "regime_name": m["regime_name"],
+                "window": m["window"],
+                "next_close": m["next_close"],
+                "next_direction": m["next_direction"],
+            }
+            for m in rows
+        ],
+    }
+
+
+@router.get("/news")
+def news(
+    req: Request,
+    limit: int = Query(25, ge=1, le=200),
+    ticker: Optional[str] = None,
+) -> dict:
+    """Return the most-recent scored news articles.
+
+    ``ticker`` (e.g. ``"BTC"``) narrows to articles mentioning that symbol.
+    Sentiment score is in [-1, +1] from the CryptoBERT + FinBERT ensemble.
+    """
+    svc = _svc(req)
+    items = svc.get_news(limit=limit, min_ticker=ticker)
+    return {"count": len(items), "items": items}
+
+
 @router.get("/gradcam")
 def gradcam(req: Request, open_time: str) -> Response:
     svc = _svc(req)
@@ -208,6 +262,28 @@ async def paper_reset(req: Request, initial_balance: float = 100.0) -> dict:
     orch = _orch(req)
     await orch.reset(initial_balance=initial_balance)
     return {"is_running": orch.is_running, "balance": orch.state.balance}
+
+
+@router.get("/paper/predictions")
+def paper_predictions(req: Request, limit: int = Query(200, ge=1, le=2000)) -> dict:
+    """Recent closed-bar predictions with their outcomes (for the
+    dashboard's accuracy card + rolling-accuracy chart)."""
+    orch = _orch(req)
+    preds = orch.state.predictions[-limit:]
+    rows = []
+    for p in preds:
+        rows.append({
+            "open_time": p.open_time.isoformat(),
+            "close_price": p.close_price,
+            "p_up": p.p_up,
+            "predicted_direction": p.predicted_direction,
+            "cp_singleton": p.cp_singleton,
+            "decision": p.decision,
+            "regime": p.regime,
+            "actual_direction": p.actual_direction,
+            "correct": p.correct,
+        })
+    return {"count": len(rows), "predictions": rows}
 
 
 # ---------------------------------------------------------------------------

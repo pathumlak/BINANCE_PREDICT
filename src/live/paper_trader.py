@@ -79,6 +79,32 @@ class ClosedTrade:
 
 
 @dataclass
+class PredictionRecord:
+    """One closed-bar prediction, its outcome, and whether it was traded.
+
+    Used to compute *model accuracy* separately from *trading P&L*:
+      * Overall accuracy across all closed bars (regardless of gate)
+      * Accuracy on confident bars (conformal singleton)
+      * Accuracy on uncertain bars (conformal doubleton — should be ~50 %)
+
+    That singleton-vs-doubleton comparison is the calibrated-uncertainty
+    money-shot: if calibration is honest, confident predictions should
+    be **more** accurate than uncertain ones by a measurable margin.
+    """
+    open_time: pd.Timestamp       # bar the prediction is FOR
+    close_price: float            # bar's close (settles the previous bar)
+    p_up: float
+    predicted_direction: int      # 1 = up, 0 = down (argmax of p_up)
+    cp_singleton: bool            # True if conformal set is one class
+    decision: str                 # "long" / "short" / "flat"
+    regime: Optional[int]
+
+    # Filled in on the NEXT bar close (once we know the outcome):
+    actual_direction: Optional[int] = None    # 1 if next_close > close
+    correct: Optional[bool] = None            # actual == predicted
+
+
+@dataclass
 class PaperTraderState:
     initial_balance: float = 100.0
     balance: float = 100.0
@@ -94,6 +120,7 @@ class PaperTraderState:
     bars_seen: int = 0
     bars_traded: int = 0
     bars_abstained: int = 0
+    predictions: list[PredictionRecord] = field(default_factory=list)
 
     # ------------------------------------------------------------------
     def reset(self, initial_balance: float = 100.0) -> None:
@@ -108,6 +135,7 @@ class PaperTraderState:
         self.bars_seen = 0
         self.bars_traded = 0
         self.bars_abstained = 0
+        self.predictions = []
 
 
 # ---------------------------------------------------------------------------
@@ -204,6 +232,13 @@ def step(state: PaperTraderState, candle: dict, prediction: dict) -> dict:
         else pd.Timestamp(candle["open_time"], tz="UTC")
     px = float(candle["close"])
 
+    # -- retro-label the PREVIOUS prediction now that we know the outcome
+    if state.predictions:
+        prev = state.predictions[-1]
+        if prev.actual_direction is None and state.last_candle_close is not None:
+            prev.actual_direction = int(px > state.last_candle_close)
+            prev.correct = (prev.actual_direction == prev.predicted_direction)
+
     state.bars_seen += 1
     state.last_candle_close = px
     state.last_candle_time = ts
@@ -235,6 +270,20 @@ def step(state: PaperTraderState, candle: dict, prediction: dict) -> dict:
         state.open_position = None
         state.bars_abstained += 1
 
+    # -- record the prediction (correct/incorrect gets filled on next bar)
+    cp = prediction.get("conformal_set", {}) or {}
+    cp_singleton = (bool(cp.get("up")) ^ bool(cp.get("down")))
+    p_up = float(prediction.get("p_up", 0.5))
+    state.predictions.append(PredictionRecord(
+        open_time=ts,
+        close_price=px,
+        p_up=p_up,
+        predicted_direction=int(p_up >= 0.5),
+        cp_singleton=cp_singleton,
+        decision=direction,
+        regime=prediction.get("regime"),
+    ))
+
     state.equity_curve.append((ts, state.balance))
     state.last_signal = {
         "open_time": ts.isoformat(),
@@ -257,6 +306,53 @@ def step(state: PaperTraderState, candle: dict, prediction: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+def accuracy_stats(state: PaperTraderState) -> dict:
+    """Model-accuracy roll-up across ALL closed-bar predictions.
+
+    Separates confident (conformal singleton) from uncertain
+    (doubleton) predictions. Under honest calibration, the confident
+    set should hit a higher accuracy than the uncertain one — that
+    delta is direct evidence that the conformal machinery works.
+    """
+    labelled = [p for p in state.predictions if p.correct is not None]
+    n = len(labelled)
+    if n == 0:
+        return {
+            "n_labelled": 0,
+            "overall_accuracy": None,
+            "confident_accuracy": None,
+            "uncertain_accuracy": None,
+            "confident_count": 0,
+            "uncertain_count": 0,
+            "verdict": "no closed bars yet",
+        }
+    conf = [p for p in labelled if p.cp_singleton]
+    unc = [p for p in labelled if not p.cp_singleton]
+    overall = sum(1 for p in labelled if p.correct) / n
+    conf_acc = (sum(1 for p in conf if p.correct) / len(conf)) if conf else None
+    unc_acc = (sum(1 for p in unc if p.correct) / len(unc)) if unc else None
+
+    # Simple English verdict.
+    if n < 8:
+        verdict = "warming up"
+    elif overall >= 0.54:
+        verdict = "model beats a coin"
+    elif overall <= 0.46:
+        verdict = "model below coin"
+    else:
+        verdict = "coin-flip so far"
+
+    return {
+        "n_labelled": n,
+        "overall_accuracy": float(overall),
+        "confident_accuracy": float(conf_acc) if conf_acc is not None else None,
+        "uncertain_accuracy": float(unc_acc) if unc_acc is not None else None,
+        "confident_count": len(conf),
+        "uncertain_count": len(unc),
+        "verdict": verdict,
+    }
+
+
 def validity_stats(state: PaperTraderState, window: int = 50) -> dict:
     """Roll-up of recent trade quality for the dashboard."""
     trades = state.closed_trades[-window:] if window else state.closed_trades

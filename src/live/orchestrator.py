@@ -26,6 +26,7 @@ from loguru import logger
 from src.api.inference import InferenceService
 from src.live.paper_trader import (
     PaperTraderState,
+    accuracy_stats,
     step as paper_step,
     validity_stats,
 )
@@ -153,6 +154,7 @@ class LiveOrchestrator:
     def snapshot(self, n_trades: int = 20) -> dict:
         s = self.state
         stats = validity_stats(s, window=50)
+        acc = accuracy_stats(s)
         open_pos = None
         if s.open_position is not None:
             p = s.open_position
@@ -209,6 +211,7 @@ class LiveOrchestrator:
             "recent_trades": recent,
             "last_signal": s.last_signal,
             "stats": stats,
+            "accuracy": acc,
             "equity_curve": [
                 {"open_time": t.isoformat(), "balance": float(b)}
                 for t, b in eq

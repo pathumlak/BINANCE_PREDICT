@@ -38,7 +38,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from src.config import PROJECT_ROOT
+from src.config import PROJECT_ROOT, load_config
 from src.features.dataset import build_dataset, load_ohlcv
 from src.features.numerical import build_features
 from src.features.targets import make_direction_label
@@ -95,6 +95,7 @@ class InferenceService:
         self._load_regimes()
         self._load_pattern_engine()
         self._load_cnn()
+        self._load_news()
         self._fit_anchor_fusion()
         log.info("[InferenceService] ready")
 
@@ -163,6 +164,100 @@ class InferenceService:
         self._cnn = model
         self._norm = norm
         log.info(f"[InferenceService] loaded CNN from {ckpt_path}")
+
+    # ------------------------------------------------------------------
+    def _load_news(self) -> None:
+        """Concatenate every scored news parquet into one in-memory frame.
+
+        The dashboard shows the most recent N articles alongside their
+        CryptoBERT+FinBERT ensemble score. Missing / malformed rows are
+        gracefully skipped.
+        """
+        import json  # noqa: PLC0415
+        cfg = load_config()
+        root = cfg.storage.root_path / "news"
+        self._news: Optional[pd.DataFrame] = None
+        if not root.exists():
+            log.warning(f"[InferenceService] no news root at {root}")
+            return
+        files = sorted(root.glob("*/*.parquet"))
+        if not files:
+            log.warning(f"[InferenceService] no news files under {root}")
+            return
+        try:
+            frames = [pd.read_parquet(f) for f in files]
+            news = pd.concat(frames, ignore_index=True)
+        except Exception as e:                             # noqa: BLE001
+            log.exception(f"news load failed: {e}")
+            return
+
+        # Decode sentiment JSON into columns.
+        def _decode(s):
+            if s is None or (isinstance(s, float) and np.isnan(s)):
+                return None
+            try:
+                return json.loads(s) if isinstance(s, str) else s
+            except Exception:                              # noqa: BLE001
+                return None
+
+        if "sentiment" in news.columns:
+            decoded = news["sentiment"].map(_decode)
+            news["sent_score"] = decoded.map(
+                lambda d: (d.get("ensemble")
+                           if isinstance(d, dict) else None)
+            )
+            news["sent_conf"] = decoded.map(
+                lambda d: (d.get("confidence")
+                           if isinstance(d, dict) else None)
+            )
+        else:
+            news["sent_score"] = None
+            news["sent_conf"] = None
+
+        # Timestamps → tz-aware UTC.
+        news["published_at"] = pd.to_datetime(news["published_at"], utc=True,
+                                              errors="coerce")
+        news = news.dropna(subset=["published_at"])
+        news = news.sort_values("published_at").reset_index(drop=True)
+        self._news = news
+        log.info(f"[InferenceService] loaded {len(news):,} news articles")
+
+    def get_news(self, limit: int = 25, min_ticker: Optional[str] = None) -> list[dict]:
+        """Return the most-recent ``limit`` articles.
+
+        ``min_ticker`` (e.g. ``"BTC"``) filters to articles whose
+        ``tickers`` list contains that symbol; ``None`` returns all.
+        """
+        if self._news is None or self._news.empty:
+            return []
+        df = self._news
+        if min_ticker:
+            def _has(t):
+                if isinstance(t, (list, tuple, np.ndarray)):
+                    return min_ticker in t
+                return False
+            df = df[df["tickers"].map(_has)]
+        df = df.tail(limit)
+
+        out: list[dict] = []
+        for _, r in df.iterrows():
+            tickers = r.get("tickers")
+            if not isinstance(tickers, (list, tuple, np.ndarray)):
+                tickers = []
+            score = r.get("sent_score")
+            out.append({
+                "published_at": pd.Timestamp(r["published_at"]).isoformat(),
+                "source": str(r.get("source", "")),
+                "title": str(r.get("title", "")),
+                "url": str(r.get("url", "")),
+                "tickers": list(tickers),
+                "sent_score": (float(score) if score is not None and not
+                                (isinstance(score, float) and np.isnan(score))
+                                else None),
+            })
+        # Newest first.
+        out.reverse()
+        return out
 
     # ------------------------------------------------------------------
     def _fit_anchor_fusion(self) -> None:
@@ -353,6 +448,45 @@ class InferenceService:
         buf = io.BytesIO()
         Image.fromarray(overlay).save(buf, format="PNG")
         return buf.getvalue()
+
+    # ------------------------------------------------------------------
+    # V2 — similar-match OHLCV windows (for mini charts)
+    # ------------------------------------------------------------------
+    def similar_with_windows(self, open_time: pd.Timestamp, k: int = 5,
+                             regime_filter: bool = True,
+                             window: int = 64) -> list[dict]:
+        """Top-K similar bars including their OHLC window for rendering."""
+        matches = self.similar(open_time, k=k, regime_filter=regime_filter)
+        out: list[dict] = []
+        cols = ["open", "high", "low", "close"]
+        for m in matches:
+            end_pos = self._ohlcv.index.get_indexer([m.open_time])[0]
+            if end_pos < 0 or end_pos < window - 1:
+                continue
+            start_pos = end_pos - window + 1
+            win = self._ohlcv.iloc[start_pos:end_pos + 1][cols]
+            # Also grab the NEXT bar's close so viewers can see the
+            # outcome of the pattern — that's the punchline.
+            next_close = None
+            if end_pos + 1 < len(self._ohlcv):
+                next_close = float(self._ohlcv["close"].iloc[end_pos + 1])
+            out.append({
+                "open_time": m.open_time,
+                "similarity": m.similarity,
+                "regime": m.regime,
+                "regime_name": m.regime_name,
+                "window": [
+                    {"o": float(r.open), "h": float(r.high),
+                     "l": float(r.low),  "c": float(r.close)}
+                    for r in win.itertuples()
+                ],
+                "next_close": next_close,
+                "next_direction": (
+                    None if next_close is None
+                    else int(next_close > float(win["close"].iloc[-1]))
+                ),
+            })
+        return out
 
     # ------------------------------------------------------------------
     # Phase 8 — live-bar ingestion + on-the-fly prediction

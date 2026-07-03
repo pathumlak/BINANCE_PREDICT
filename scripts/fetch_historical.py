@@ -1,7 +1,9 @@
-"""Entry point: download all configured historical OHLCV.
+"""Entry point: download configured historical OHLCV (resumable).
 
 Usage:
-    python scripts/fetch_historical.py
+    python scripts/fetch_historical.py                          # all pairs & intervals from config.yaml
+    python scripts/fetch_historical.py --pairs BTCUSDT          # narrow to one pair
+    python scripts/fetch_historical.py --pairs BTCUSDT --interval 1h
     python scripts/fetch_historical.py --config path/to/other.yaml
 """
 from __future__ import annotations
@@ -22,5 +24,13 @@ if __name__ == "__main__":
         "--config", default=None,
         help="Path to config.yaml (defaults to project-root config.yaml)",
     )
+    parser.add_argument(
+        "--pairs", nargs="+", default=None,
+        help="Override config.yaml — pull only these pairs, e.g. BTCUSDT ETHUSDT.",
+    )
+    parser.add_argument(
+        "--interval", nargs="+", default=None,
+        help="Override config.yaml — pull only these intervals, e.g. 1h 4h.",
+    )
     args = parser.parse_args()
-    main(args.config)
+    main(args.config, pairs=args.pairs, intervals=args.interval)

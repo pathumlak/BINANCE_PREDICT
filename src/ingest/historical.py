@@ -277,9 +277,23 @@ def run_plan(plan: FetchPlan, cfg: Config) -> int:
     return written
 
 
-def main(config_path: str | None = None) -> None:
+def main(config_path: str | None = None,
+         pairs: list[str] | None = None,
+         intervals: list[str] | None = None) -> None:
+    """Fetch missing OHLCV.
+
+    Optional overrides of ``pairs`` / ``intervals`` narrow the sweep at
+    the CLI without editing ``config.yaml`` — useful for a one-off
+    backfill (e.g. ``--pairs BTCUSDT --interval 1h``).
+    """
     cfg = load_config(config_path)
+    if pairs:
+        cfg.binance.pairs = list(pairs)
+    if intervals:
+        cfg.binance.intervals = list(intervals)
+
     logger.info(f"Storage root: {cfg.storage.root_path}")
+    logger.info(f"Pairs: {cfg.binance.pairs}   Intervals: {cfg.binance.intervals}")
     cfg.storage.root_path.mkdir(parents=True, exist_ok=True)
 
     plans = build_plans(cfg)
