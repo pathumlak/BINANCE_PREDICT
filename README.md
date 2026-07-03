@@ -595,9 +595,282 @@ Outputs land under `experiments/fusion/BTCUSDT/<variant>/` plus
   accumulation — the value of sentiment shows up later as the news
   archive grows.
 
-## What's next — Phase 6 preview
+# Phase 6 — Regime-aware pattern-matching engine
 
-Phase 6 builds a FAISS k-NN index over the chart-CNN embeddings already
-emitted in Phase 5's pre-flight step. Combined with HMM-classified market
-regimes (Phase 6 §2), this gives the dashboard (Phase 7) the "show me
-the K most similar historical patterns" feature.
+Phase 6 turns the chart-CNN embeddings from Phase 3 into a queryable
+similarity index, conditioned on the prevailing market regime, plus an
+EWC-protected variant of the CNN that resists catastrophic forgetting as
+the data distribution drifts over time.
+
+## What's new
+
+* **HMM regime classifier** (`src/retrieval/hmm_regimes.py`,
+  `scripts/fit_hmm_regimes.py`) — 3-state Gaussian HMM on
+  (log-return, 24h rolling vol). States are sorted by ascending mean
+  return so the integer label always means the same thing:
+  `0 = bear, 1 = sideways, 2 = bull`.
+* **FAISS index** (`src/retrieval/faiss_index.py`,
+  `scripts/build_faiss_index.py`) — `IndexFlatIP` over L2-normalised
+  128-d CNN embeddings (= cosine similarity), persisted with a meta
+  parquet that ties each row id back to its `open_time` and regime.
+* **Pattern engine** (`src/retrieval/pattern_engine.py`) — facade
+  combining FAISS + the regime labels. `engine.topk(query_vec, k,
+  regime_filter=2)` returns the K most-similar historical bars filtered
+  to bull-regime matches, with self-exclusion guarded.
+* **Retrieval eval** (`scripts/eval_pattern_engine.py`) — measures
+  next-bar direction hit-rate of the majority vote over the top-K
+  retrieved bars, with and without the regime filter, so the value-add
+  of the HMM is quantifiable.
+* **EWC trainer** (`src/retrieval/ewc.py`,
+  `scripts/train_cnn_ewc.py`) — Elastic Weight Consolidation
+  (Kirkpatrick 2017) for the chart-CNN. Splits the timeline
+  chronologically into K phases, trains sequentially with and without
+  EWC, and reports the average post-final accuracy on every prior
+  phase's holdout — directly measuring catastrophic forgetting.
+
+## Pre-conditions
+
+```bash
+# Phase 3 — CNN embeddings (slow: 15-25 min on CPU, run once)
+python scripts/extract_chart_embeddings.py --pairs BTCUSDT --interval 1h --encoder candle
+```
+
+## Smoke test
+
+```bash
+python scripts/fit_hmm_regimes.py --pairs BTCUSDT --interval 1h
+python scripts/build_faiss_index.py --pairs BTCUSDT --interval 1h
+python scripts/smoke_phase6.py
+```
+
+Should print regime-share counts, load the FAISS index, and verify that
+regime-filtered top-K queries return matches that all share the query's
+regime (no leakage) and never match the query bar itself.
+
+## Full retrieval evaluation
+
+```bash
+python scripts/eval_pattern_engine.py --pair BTCUSDT --k 10 --max-test-bars 2000
+```
+
+Outputs `experiments/retrieval/BTCUSDT/eval_pattern_engine.{csv,json}`
+with two hit-rate numbers — with vs without regime filter. A positive
+delta (regime > no-filter) supports the thesis that HMM context
+genuinely improves retrieval quality.
+
+## EWC continual learning
+
+This is the slow part of Phase 6 — three sequential CNN trainings each
+take ~10–15 min on CPU. Run once, you keep the result.
+
+```bash
+python scripts/train_cnn_ewc.py --pair BTCUSDT --interval 1h \
+    --n-phases 3 --epochs-per-phase 6 --lambda-ewc 5000
+```
+
+Outputs `experiments/retrieval/cnn_ewc_{naive,ewc}/metrics.json` with
+per-phase test accuracy on every prior phase's holdout. The headline
+metric is `avg_final_accuracy` — average across all three phase
+holdouts at the end of training. EWC should match or beat naive
+sequential training, by a wider margin the larger the distribution drift
+between phases.
+
+## Sanity rules of thumb (Phase 6 specific)
+
+* If `regime_summary` shows one state with > 80 % share, the HMM did not
+  converge cleanly — try a longer warmup or set `--n-states 2`.
+* If `hit_rate` is near 0.50 for both filtered and unfiltered retrieval,
+  the embeddings carry no usable signal beyond random — re-examine the
+  Phase 3 Grad-CAMs.
+* If EWC's `avg_final_accuracy` is *lower* than naive's, `lambda-ewc`
+  is too large and the new tasks can't learn at all. Halve it.
+
+# Phase 7 — Interactive dashboard
+
+Phase 7 is the user-facing demo: a FastAPI backend that wraps the
+Phase 5 fusion model + the Phase 6 pattern engine, served with a
+single-page TradingView Lightweight Charts UI. Click any candle and you
+get (1) the fused next-bar prediction with calibrated 90% conformal set,
+(2) the K most-similar historical bars (regime-filtered), and (3) a
+Grad-CAM overlay of what the CNN attended to.
+
+## What's new
+
+* **Inference service** (`src/api/inference.py`) — a singleton loaded
+  once at app start that holds the OHLCV cache, engineered features,
+  CNN embeddings, sentiment features, HMM regimes, FAISS index, and a
+  fusion model fit on the first 90 % of the historical overlap with
+  conformal calibration baked in. The last 10 % is the
+  "demo-predictable" window the model has never seen.
+* **HTTP API** (`src/api/{routes,models,app}.py`) — six endpoints:
+  `/api/health`, `/api/pairs`, `/api/candles`, `/api/regimes`,
+  `/api/predict`, `/api/similar`, `/api/gradcam`. All return JSON
+  except Grad-CAM, which returns a PNG.
+* **Vanilla-JS frontend** (`src/api/static/{index.html,app.js,styles.css}`)
+  — no build step, no React toolchain; Lightweight Charts is loaded
+  from a CDN. Dark theme matched to TradingView's defaults.
+* **TestClient smoke** (`scripts/smoke_phase7.py`) — boots the app
+  in-process and exercises every endpoint, including the Grad-CAM
+  fall-through when no CNN checkpoint is on disk.
+
+## Pre-conditions
+
+The dashboard only loads data — it doesn't train anything new — so make
+sure the earlier phases have produced their artefacts:
+
+```
+data/ohlcv/BTCUSDT/1h/*.parquet                   # Phase 1
+data/features_sentiment/BTCUSDT/1h.parquet        # Phase 4
+experiments/embeddings/BTCUSDT/1h/candle/embeddings.parquet  # Phase 3
+data/regimes/BTCUSDT/1h.parquet                   # Phase 6 step 1
+experiments/retrieval/BTCUSDT/1h/index.faiss      # Phase 6 step 2
+experiments/retrieval/BTCUSDT/1h/meta.parquet     # Phase 6 step 2
+experiments/retrieval/cnn_ewc_naive/final_model.pt   # Phase 6 step 3 (optional — needed for Grad-CAM)
+```
+
+If the CNN checkpoint is missing the dashboard still runs; only the
+`/api/gradcam` endpoint becomes a 503 with a clear "run this first"
+hint.
+
+## Smoke test
+
+```bash
+python scripts/smoke_phase7.py
+```
+
+Boots FastAPI in-process via TestClient, hits every endpoint, and
+prints a one-line summary of each response. Should end with
+`smoke phase 7 OK`.
+
+## Run the dashboard
+
+```bash
+python scripts/run_dashboard.py
+```
+
+Then open <http://127.0.0.1:8000> in your browser. First request takes
+5–15 s while the InferenceService boots and the anchor fusion model
+fits; after that every query is sub-second.
+
+For a live-reload dev loop:
+
+```bash
+python scripts/run_dashboard.py --reload --port 8001
+```
+
+## Reading the dashboard
+
+* The candle chart in the centre is the most recent N bars (configurable
+  via the dropdown).
+* The thin coloured strip below the chart encodes the HMM regime per bar
+  — green = bull, red = bear, grey = sideways.
+* Clicking a candle populates the right-hand cards: the **Prediction**
+  card shows P(up), the argmax label, the conformal 90% prediction set
+  (which classes are inside it), and whether the bar is in the
+  demo-predictable window or back in the model's fit window.
+* The **Top-K similar** card lists the closest historical matches by
+  cosine similarity over the CNN embedding, optionally filtered to the
+  query bar's regime. Click a match to jump the query to it.
+* The **Grad-CAM** card shows the chart window the CNN saw, overlaid
+  with the class-activation map for the bullish-direction logit.
+
+## Caveats / scope notes
+
+* Single pair (BTCUSDT 1h) at a time. The InferenceService is templated
+  on `(pair, interval)` so adding more pairs is a one-line change once
+  their Phase 3 / Phase 6 artefacts exist.
+* Predictions on bars *inside* the anchor-fit window are still served,
+  but the UI badges them with a yellow "in fit window" pill so a viva
+  panellist can immediately tell which predictions are honest held-out
+  evidence.
+* No authentication, no rate-limiting, no DB. This is a research
+  artefact, not a SaaS.
+
+# Phase 8 — Live paper trading
+
+Phase 8 extends the dashboard with a **live walk-forward demo**: the
+dashboard subscribes to Binance's WebSocket for closed BTCUSDT 1h
+candles, runs the Phase 5 fusion model on each one as it arrives,
+trades a $100 paper account, and reports whether the strategy is
+making or losing money in real time.
+
+This is the strongest possible piece of evidence for a viva panel —
+not "p-value on a 4-year backtest" but "**watch it work, or fail,
+right now**".
+
+## How it trades
+
+* **Trade only on confident bars.** A position is opened *only* when
+  the Phase 5 conformal prediction set is a singleton — i.e. the model
+  has calibrated 90 % confidence in one direction. If both classes are
+  inside the set, the bot stays flat for that hour. This is the
+  calibrated-uncertainty story paying off in $.
+* **Vol-scaled sizing.** Each trade is sized as
+  ``size_pct = clip(vol_168h / vol_24h, 0.10, 1.00)`` of the current
+  balance. When BTC is calm, the bot bets more; when BTC is wild, less.
+  This delivers approximately constant dollar-volatility per trade.
+* **Settle-on-next-close.** A trade opened at the close of bar *t*
+  closes at the close of bar *t+1*. There are no fees, no slippage —
+  this is a frictionless simulation of the model's binary directional
+  call, not a brokerage.
+
+## What gets shown on the dashboard
+
+The new card on the right rail shows, polled every 2 seconds:
+
+* Balance and total P&L (green when positive, red when negative).
+* Win-rate and Sharpe-per-trade over the last 50 closed trades.
+* A **Verdict** line — one of `model is working`, `model is losing`,
+  `inconclusive`, `warming up` — for at-a-glance confidence.
+* The open position (if any) and the last signal that produced it.
+* A sparkline equity curve.
+* The last 10 closed trades with their direction and P&L.
+
+## Pre-conditions
+
+Everything Phase 7 needs, plus an outbound network connection to
+``stream.binance.com:9443``. No new files have to exist on disk; Phase 8
+only runs in-memory.
+
+## Smoke test
+
+```bash
+python scripts/smoke_phase8.py
+```
+
+Boots the FastAPI app in-process, feeds 30 synthetic closed candles
+through the orchestrator (no real WebSocket call), and asserts:
+features are recomputed, the CNN embedding succeeds, the fusion model
+returns a valid prediction, the paper-trader's confidence gate
+distinguishes trades vs abstentions, the balance updates, and the
+``/api/paper/{start,stop,reset}`` endpoints round-trip. Finishes in
+about a minute.
+
+## Launching the live demo
+
+```bash
+python scripts/run_dashboard.py
+```
+
+Open <http://127.0.0.1:8000>, scroll to the Live paper-trading card on
+the right, click **Start**. The dashboard now subscribes to Binance and
+waits for the next closed 1h candle. The first trade appears at the
+top of the next UTC hour (could be 0–60 minutes after Start depending
+on when you click).
+
+Click **Stop** to disconnect; **Reset $100** to clear the books.
+
+## Honest caveats for the viva
+
+* Paper trading **only** — no order is ever placed on Binance, no
+  credentials are read, no withdrawal endpoint exists. The orchestrator
+  never imports `python-binance`'s trading client.
+* Restarting the server **clears the paper-trader's books**. This is
+  intentional: persisting P&L across runs would invite treating the
+  system as a brokerage, which it explicitly is not.
+* The demo runs **one trade per hour** (the smallest unit the model was
+  trained on). Expect minutes-to-hours of wall-clock time between
+  visible state changes.
+* The Verdict line needs **at least 8 closed trades** to leave the
+  "warming up" state. Plan ~8–10 hours of dashboard uptime for a
+  panel-ready Verdict.

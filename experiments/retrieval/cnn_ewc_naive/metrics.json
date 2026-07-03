@@ -1,0 +1,49 @@
+{
+  "mode": "naive",
+  "pair": "BTCUSDT",
+  "interval": "1h",
+  "encoder": "candle",
+  "n_phases": 3,
+  "epochs_per_phase": 6,
+  "lambda_ewc": 0.0,
+  "avg_final_accuracy": 0.555336228451112,
+  "elapsed_seconds": 3180.76,
+  "phases": [
+    {
+      "phase": 0,
+      "n_train": 22792,
+      "n_test": 2533,
+      "train_loss": 0.6756052052175013,
+      "val_loss": 0.6888929362882648,
+      "epochs_run": 6,
+      "post_phase_test_accuracies": [
+        0.5475720489538097
+      ]
+    },
+    {
+      "phase": 1,
+      "n_train": 22792,
+      "n_test": 2533,
+      "train_loss": 0.6830723123877729,
+      "val_loss": 0.6885437814812911,
+      "epochs_run": 4,
+      "post_phase_test_accuracies": [
+        0.5641531780497434,
+        0.5546782471377812
+      ]
+    },
+    {
+      "phase": 2,
+      "n_train": 22793,
+      "n_test": 2533,
+      "train_loss": 0.6851041247975685,
+      "val_loss": 0.6928933474055508,
+      "epochs_run": 4,
+      "post_phase_test_accuracies": [
+        0.5740228977497039,
+        0.5527043031977892,
+        0.5392814844058429
+      ]
+    }
+  ]
+}

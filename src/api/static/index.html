@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Multimodal Crypto Predictor — Phase 7 Dashboard</title>
+  <link rel="stylesheet" href="/styles.css" />
+  <!-- TradingView Lightweight Charts (CDN) -->
+  <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+</head>
+<body>
+  <header>
+    <h1>
+      BTCUSDT 1h — multimodal direction predictor
+      <span id="live-badge" class="pill sideways" title="not connected">◌ offline</span>
+    </h1>
+    <div id="meta">loading metadata…</div>
+  </header>
+
+  <main>
+    <section id="chart-area">
+      <div id="chart-controls">
+        <label>Bars to load:
+          <select id="limit-select">
+            <option value="200">200</option>
+            <option value="500" selected>500</option>
+            <option value="1000">1000</option>
+            <option value="2000">2000</option>
+          </select>
+        </label>
+        <label>End at:
+          <input type="text" id="end-input" placeholder="(latest)" />
+        </label>
+        <button id="reload-btn">Reload</button>
+        <span id="hint">click a candle to inspect</span>
+      </div>
+      <div id="chart"></div>
+      <div id="regime-strip"></div>
+    </section>
+
+    <aside id="side">
+      <section id="prediction-panel" class="card">
+        <h2>Prediction</h2>
+        <div id="prediction-body" class="empty">
+          Click a candle to see the fused prediction.
+        </div>
+      </section>
+
+      <section id="similar-panel" class="card">
+        <h2>Top-K similar historical patterns</h2>
+        <label class="inline">
+          <input type="checkbox" id="regime-toggle" checked />
+          Filter by regime
+        </label>
+        <div id="similar-body" class="empty">
+          (no query yet)
+        </div>
+      </section>
+
+      <section id="gradcam-panel" class="card">
+        <h2>Grad-CAM</h2>
+        <div id="gradcam-body" class="empty">
+          (no query yet)
+        </div>
+      </section>
+
+      <section id="paper-panel" class="card">
+        <h2>Live paper trading</h2>
+        <div id="paper-controls">
+          <button id="paper-start-btn" class="primary">Start</button>
+          <button id="paper-stop-btn" class="secondary">Stop</button>
+          <button id="paper-reset-btn" class="secondary">Reset $100</button>
+        </div>
+        <div id="paper-status" class="empty">not started</div>
+        <div id="paper-summary"></div>
+        <svg id="equity-spark" viewBox="0 0 240 60" preserveAspectRatio="none"></svg>
+        <div id="paper-trades"></div>
+      </section>
+    </aside>
+  </main>
+
+  <footer>
+    Phase 5 fusion (numeric + CNN + sentiment, conformal&nbsp;α=0.10) &nbsp;·&nbsp;
+    Phase 6 FAISS k-NN with 3-state HMM regime filter &nbsp;·&nbsp;
+    <code>research preview</code>
+  </footer>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

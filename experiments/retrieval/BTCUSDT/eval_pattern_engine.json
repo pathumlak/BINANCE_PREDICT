@@ -1,0 +1,11 @@
+{
+  "no_filter__hit_rate": 0.524,
+  "no_filter__n_queries": 2000.0,
+  "no_filter__avg_n_matches": 10.0,
+  "with_regime_filter__hit_rate": 0.5185,
+  "with_regime_filter__n_queries": 2000.0,
+  "with_regime_filter__avg_n_matches": 10.0,
+  "elapsed_seconds": 52.75,
+  "k": 10,
+  "test_bars": 2000
+}

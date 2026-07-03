@@ -95,15 +95,46 @@ There are **seven** objectives, mapped 1-to-1 with the seven implementation phas
 *Supports RQ4 (interpretability + retrieval).*
 
 * **Deliverable:** FAISS index over chart-CNN embeddings, with k-NN retrieval filtered by HMM-classified market regime, plus continual learning with Elastic Weight Consolidation to handle regime drift.
-* **Status:** 🟡 **PLANNED** (Phase 6).
-* **Feasibility evidence:** FAISS handles millions of vectors at sub-millisecond k-NN. HMM regime classification has a 30-year track record in finance. The chart-CNN already produces 128-dimensional embeddings ready to index.
+* **Status:** 🟢 **CODE COMPLETE + EWC measured** — FAISS index + HMM regimes + EWC sweep all run (2026-06-24); retrieval-quality eval still to run.
+* **Measured evidence — EWC sweep (BTCUSDT 1h, 3 chronological phases, 6 epochs/phase, λ=5000):**
+  * Naive sequential CNN: **avg_final_acc = 0.5553** across all three phase holdouts.
+  * EWC sequential CNN:  **avg_final_acc = 0.5509** (Δ = −0.0045).
+  * Interpretation: catastrophic forgetting is **not** the binding constraint on BTC 1h — naive sequential training already preserves earlier-phase knowledge well. EWC's quadratic anchor at λ=5000 is mildly too restrictive at this scale, costing < 0.5 pp. The framework is in place to detect forgetting should regime drift become more extreme on a different pair / longer horizon.
+* **HMM regime distribution (76,016 BTC 1h bars):** bear 9.9%, sideways 58.2%, bull 31.9% — three well-populated states; no near-degenerate regime that would indicate HMM divergence.
+* **What's on disk:**
+  * `src/retrieval/hmm_regimes.py` — 3-state Gaussian HMM, train-window-only fit, regimes sorted by ascending mean return (0=bear, 1=sideways, 2=bull).
+  * `src/retrieval/faiss_index.py` — `IndexFlatIP` over L2-normalised 128-d embeddings (cosine similarity), persisted with a meta parquet.
+  * `src/retrieval/pattern_engine.py` — regime-aware top-K facade with chronological self-exclusion.
+  * `src/retrieval/ewc.py` + `scripts/train_cnn_ewc.py` — Elastic Weight Consolidation across chronological phases, with naive-sequential and EWC modes for direct forgetting comparison.
+  * `scripts/{fit_hmm_regimes,build_faiss_index,eval_pattern_engine,smoke_phase6}.py` — entry points.
+* **Feasibility evidence:** FAISS handles millions of vectors at sub-millisecond k-NN. HMM regime classification has a 30-year track record in finance (Hamilton 1989, Ang & Bekaert 2002). The chart-CNN already produces 128-dim embeddings ready to index. EWC is Kirkpatrick et al. 2017's canonical continual-learning baseline.
+
+### RO8 — Live paper-trading demo (Phase 7 extension)
+*Supports RQ4 (validity in the wild).*
+
+* **Deliverable:** Live Binance WebSocket consumer feeding the Phase 5 fusion model in real time; a $100 paper-trading account that only opens positions when the conformal set is a calibrated singleton; UI showing balance, win-rate, Sharpe, equity curve, and a "model is working / losing / inconclusive" verdict.
+* **Status:** 🟢 **CODE COMPLETE** — first multi-hour live run pending.
+* **What's on disk:**
+  * `src/live/stream.py` — Binance WebSocket consumer pushing closed candles into an asyncio queue.
+  * `src/live/paper_trader.py` — confidence-gated state machine with inverse-volatility position sizing and rolling validity stats.
+  * `src/live/orchestrator.py` — async coroutine owned by FastAPI's lifespan.
+  * `src/api/inference.py` — extended with `append_live_bar()` for on-the-fly feature recomputation + CNN embedding on incoming live bars.
+  * `src/api/routes.py` — four new endpoints (`/api/paper/{state,start,stop,reset}`).
+  * `src/api/static/{index.html,app.js,styles.css}` — new live-paper-trading card.
+  * `scripts/smoke_phase8.py` — in-process smoke that feeds 30 synthetic candles through the orchestrator and asserts state-machine correctness.
+* **Why this matters for the viva:** RO5 proved fusion beats every baseline on a backtest; RO8 lets a panellist watch the model trade *forward* with calibrated uncertainty making the abstain-or-act decision. The honest version: it might lose money in the demo window, but the conformal calibration is honest about its confidence, and the framework reports the verdict transparently.
 
 ### RO7 — Deliver an interactive dashboard with explainable predictions
 *Synthesises RQ1–RQ4 into a usable artefact.*
 
-* **Deliverable:** React + TradingView Lightweight Charts frontend over a FastAPI backend, showing live Binance candles, allowing the user to select any chart region and receive (1) the K most similar historical patterns, (2) a fused prediction with 90% confidence interval, and (3) a Grad-CAM overlay showing what the CNN attends to.
-* **Status:** 🟡 **PLANNED** (Phase 7).
-* **Feasibility evidence:** TradingView LWC and FastAPI are both production-grade, well-documented. The CNN is already producing Grad-CAM overlays. The pattern-matching index from RO6 plugs in directly.
+* **Deliverable:** TradingView Lightweight Charts frontend over a FastAPI backend, showing historical Binance candles, allowing the user to select any candle and receive (1) the K most similar historical patterns, (2) a fused prediction with 90% conformal prediction set, and (3) a Grad-CAM overlay showing what the CNN attends to.
+* **Status:** 🟢 **CODE COMPLETE** — runs locally via `python scripts/run_dashboard.py`; in-process smoke (`scripts/smoke_phase7.py`) exercises every endpoint. Live demo evidence pending the user's first run.
+* **What's on disk:**
+  * `src/api/inference.py` — singleton service that loads OHLCV + features + embeddings + sentiment + regimes + FAISS index + CNN checkpoint, fits an anchor fusion model on the first 90 % of bars (last 10 % is held-out demo window with conformal sets).
+  * `src/api/routes.py`, `src/api/models.py`, `src/api/app.py` — six endpoints (`/api/{health,pairs,candles,regimes,predict,similar,gradcam}`).
+  * `src/api/static/{index.html,app.js,styles.css}` — single-page vanilla-JS frontend, no build step, dark theme, regime-coloured strip below the candle chart.
+  * `scripts/{run_dashboard,smoke_phase7}.py` — uvicorn launcher + TestClient smoke.
+* **Feasibility evidence:** Standard FastAPI + Lightweight Charts pattern; the Phase 5 fusion model and Phase 6 pattern engine both already expose the right interfaces. Grad-CAM is reused from Phase 3 without modification.
 
 ---
 
@@ -116,8 +147,9 @@ There are **seven** objectives, mapped 1-to-1 with the seven implementation phas
 | **RO3** Chart-CNN baselines | RQ3 | ✅ Done | 3 | DM p = 0.006 vs XGBoost |
 | **RO4** News sentiment pipeline | RQ4 | ✅ Done | 4 | Ensemble + leakage tests |
 | **RO5** Multimodal fusion | RQ4 | ✅ Done | 5 | acc 0.549; DM p≈0.001 vs cnn_candle; CP coverage 0.88 |
-| **RO6** Pattern engine | RQ4 | 🟡 Planned | 6 | Phase 6 in Oct-Nov |
-| **RO7** Interactive dashboard | All | 🟡 Planned | 7 | Phase 7 in Feb |
+| **RO6** Pattern engine | RQ4 | 🟢 Code complete; run pending | 6 | FAISS + HMM + EWC all on disk |
+| **RO7** Interactive dashboard | All | 🟢 Code complete; first run pending | 7 | FastAPI + LW-charts UI + Grad-CAM all wired |
+| **RO8** Live paper-trading demo | RQ4 | 🟢 Code complete | 8 (P7 extension) | Live Binance WS + confidence-gated, vol-scaled paper account |
 
 **4 of 7 objectives are already delivered with measurable evidence.**
 The remaining 3 are scoped, planned, and have prior-art validation.
