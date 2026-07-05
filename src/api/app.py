@@ -26,6 +26,7 @@ from fastapi.staticfiles import StaticFiles
 from src.api.inference import InferenceService
 from src.api.routes import router
 from src.live.orchestrator import LiveOrchestrator
+from src.live.retrainer import RetrainerScheduler
 from src.live.stream import MulticastCandleStream
 
 log = logging.getLogger("phase7.app")
@@ -59,13 +60,33 @@ def create_app(pair: str = "BTCUSDT", interval: str = "1h") -> FastAPI:
             inference=app.state.inference, initial_balance=100.0,
             multicast=app.state.multicast,
         )
+        # Nightly refit of HMM + FAISS + fusion so the model stays fresh
+        # on newly-arrived bars without any manual scripts/refresh_all.py.
+        app.state.retrainer = RetrainerScheduler(
+            inference=app.state.inference,
+            orchestrator=app.state.orchestrator,
+        )
+        try:
+            await app.state.retrainer.start()
+        except Exception:                                # noqa: BLE001
+            log.exception("retrainer start failed — dashboard still runs")
+
         log.info("[Phase 7] ready")
         yield
         log.info("[Phase 7] shutting down")
         try:
+            await app.state.retrainer.stop()
+        except Exception:                                # noqa: BLE001
+            log.exception("retrainer shutdown failed")
+        try:
             await app.state.orchestrator.stop()
         except Exception:                                # noqa: BLE001
             log.exception("orchestrator shutdown failed")
+        try:
+            if app.state.orchestrator.persistor is not None:
+                app.state.orchestrator.persistor.flush()
+        except Exception:                                # noqa: BLE001
+            log.exception("final persistence flush failed")
         try:
             await app.state.multicast.stop()
         except Exception:                                # noqa: BLE001

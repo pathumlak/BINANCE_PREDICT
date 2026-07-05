@@ -65,6 +65,10 @@ const state = {
   currentBarTime: null,   // ISO — the most-recent labelled bar we can predict on
   lastPrediction: null,
   autoStartAttempted: false,
+  markMode: false,          // waiting for two clicks
+  markStartSec: null,       // first click (UNIX seconds)
+  markEndSec: null,         // second click
+  markPriceLines: [],       // Lightweight-charts price lines used for the band
 };
 
 const dom = {
@@ -98,6 +102,10 @@ const dom = {
   newsCount: document.getElementById('news-count'),
 
   gradcam: document.getElementById('gradcam-body'),
+
+  retrainStatus: document.getElementById('retrain-status'),
+  retrainSummary: document.getElementById('retrain-summary'),
+  retrainBtn: document.getElementById('retrain-btn'),
 };
 
 // ---------------------------------------------------------------------
@@ -122,6 +130,10 @@ function initChart() {
   });
   chart.subscribeClick(param => {
     if (!param || !param.time) return;
+    if (state.markMode) {
+      handleMarkClick(Number(param.time));
+      return;
+    }
     const iso = secToIso(Number(param.time));
     state.currentBarTime = iso;
     refreshPredictionAndSimilar(iso);
@@ -129,6 +141,134 @@ function initChart() {
   state.chart = chart;
   state.series = series;
 }
+
+// ---------------------------------------------------------------------
+// Mark-range drawing tool — click A then B on the chart to define
+// a shaded band, then auto-run range analysis + similar-pattern
+// suggestions for the marked window's END bar.
+// ---------------------------------------------------------------------
+function setMarkHint(text) {
+  let el = document.getElementById('mark-hint');
+  if (!text) {
+    if (el) el.remove();
+    return;
+  }
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'mark-hint';
+    document.getElementById('chart').appendChild(el);
+  }
+  el.textContent = text;
+}
+
+function toggleMarkMode() {
+  state.markMode = !state.markMode;
+  const btn = document.getElementById('mark-btn');
+  btn.classList.toggle('active', state.markMode);
+  btn.textContent = state.markMode ? '✎ Marking… click A' : '✎ Mark range';
+  document.getElementById('clear-mark-btn').hidden = !hasMark();
+  setMarkHint(state.markMode ? 'Click the first candle to start the range' : null);
+  if (!state.markMode && !hasMark()) {
+    clearMarkOverlay();
+  }
+}
+
+function hasMark() {
+  return state.markStartSec != null && state.markEndSec != null;
+}
+
+async function handleMarkClick(timeSec) {
+  if (state.markStartSec == null) {
+    state.markStartSec = timeSec;
+    setMarkHint(`A locked at ${fmtDate(secToIso(timeSec))}Z — click the second candle`);
+    return;
+  }
+  state.markEndSec = timeSec;
+  if (state.markEndSec < state.markStartSec) {
+    [state.markStartSec, state.markEndSec] = [state.markEndSec, state.markStartSec];
+  }
+  toggleMarkMode();                         // exit mark mode
+  document.getElementById('clear-mark-btn').hidden = false;
+  drawMarkOverlay();
+  await runMarkAnalysis();
+}
+
+function drawMarkOverlay() {
+  clearMarkOverlay();
+  if (!hasMark()) return;
+  const s = state.markStartSec, e = state.markEndSec;
+  // Find close prices at the two endpoints to place horizontal band lines.
+  const inRange = state.candles.filter(c =>
+    isoToSec(c.open_time) >= s && isoToSec(c.open_time) <= e);
+  if (inRange.length === 0) return;
+  const hi = Math.max(...inRange.map(c => c.high));
+  const lo = Math.min(...inRange.map(c => c.low));
+  const first = inRange[0], last = inRange[inRange.length - 1];
+  // Two horizontal price lines at the range's high and low form a band.
+  const styleTop = state.series.createPriceLine({
+    price: hi, color: '#4dabf7', lineWidth: 1,
+    lineStyle: LightweightCharts.LineStyle.Dashed,
+    axisLabelVisible: true,
+    title: `mark hi ${hi.toFixed(0)}`,
+  });
+  const styleBot = state.series.createPriceLine({
+    price: lo, color: '#4dabf7', lineWidth: 1,
+    lineStyle: LightweightCharts.LineStyle.Dashed,
+    axisLabelVisible: true,
+    title: `mark lo ${lo.toFixed(0)}`,
+  });
+  state.markPriceLines = [styleTop, styleBot];
+  const bars = inRange.length;
+  const spanHrs = ((e - s) / 3600).toFixed(1);
+  const chg = ((last.close - first.close) / first.close * 100).toFixed(2);
+  setMarkHint(`Marked ${bars} bars · ${spanHrs}h · Δ ${chg}%`);
+}
+
+function clearMarkOverlay() {
+  for (const pl of state.markPriceLines) {
+    try { state.series.removePriceLine(pl); } catch {}
+  }
+  state.markPriceLines = [];
+}
+
+function clearMark() {
+  state.markStartSec = null;
+  state.markEndSec = null;
+  clearMarkOverlay();
+  setMarkHint(null);
+  document.getElementById('clear-mark-btn').hidden = true;
+}
+
+async function runMarkAnalysis() {
+  const panel = document.getElementById('analyze-panel');
+  const body  = document.getElementById('analyze-body');
+  const label = document.getElementById('analyze-range');
+  panel.hidden = false;
+  body.innerHTML = '<div class="empty">analyzing marked range…</div>';
+
+  const startIso = secToIso(state.markStartSec);
+  const endIso   = secToIso(state.markEndSec);
+
+  try {
+    const a = await API('/api/analyze/range', { start: startIso, end: endIso });
+    label.textContent = `${fmtDate(a.start)}Z → ${fmtDate(a.end)}Z · ${a.bars} bars · MARKED`;
+    renderAnalysis(a);
+  } catch (e) {
+    body.innerHTML = `<div class="empty">analysis failed: ${e.message}</div>`;
+  }
+
+  // Also update the "similar patterns" strip using the end bar of the
+  // mark — so the top-K reflects what the user selected, not the live
+  // bar. Backend does its own fallback if the end bar has no embedding.
+  try {
+    await refreshSimilarWithFallback(endIso);
+  } catch { /* already surfaces its own error */ }
+}
+
+document.getElementById('mark-btn').addEventListener('click', toggleMarkMode);
+document.getElementById('clear-mark-btn').addEventListener('click', () => {
+  clearMark();
+});
 
 async function loadHealth() {
   const h = await API('/api/health');
@@ -206,45 +346,43 @@ function pickCandidateBars(preferredIso) {
   return list;
 }
 
-// Walk back through recent bars looking for one whose CNN embedding is
-// on disk. If we ONLY have historical embeddings (i.e. the user hasn't
-// run extract_chart_embeddings.py since the last backfill), the newest
-// query bar will 404 — but a bar from a few days ago will succeed and
-// still gives the panel useful patterns to show.
+// One request, backend auto-falls-back to the newest embedded bar if
+// the live bar has no embedding yet. No walk-backward on the client.
 async function refreshSimilarWithFallback(preferredIso) {
-  const bars = pickCandidateBars(preferredIso).concat(
-    state.candles.slice(-200, -8).map(c => c.open_time).reverse()
-  );
-  for (const ts of bars) {
-    try {
-      await loadSimilarDetailed(ts);
-      if (ts !== preferredIso) {
-        // Note the fallback in the UI so users know what happened.
-        dom.similarGrid.insertAdjacentHTML('afterbegin',
-          `<div style="grid-column:1/-1;font-size:11px;color:var(--fg-muted);font-style:italic;margin-bottom:4px;">`
-          + `showing patterns for ${fmtDate(ts)}Z (embedding parquet has no entry yet for ${fmtDate(preferredIso)}Z — run <code>refresh_all.py</code> without <code>--skip-cnn</code>)</div>`);
-      }
-      return;
-    } catch (e) {
-      /* try older */
+  try {
+    const s = await API('/api/similar/detailed', {
+      open_time: preferredIso, k: 5,
+      regime_filter: dom.regimeToggle.checked,
+      fallback: true,
+    });
+    renderSimilarStrip(s.matches);
+    if (s.fallback_used) {
+      dom.similarGrid.insertAdjacentHTML('afterbegin',
+        `<div style="grid-column:1/-1;font-size:11px;color:var(--fg-muted);font-style:italic;margin-bottom:4px;">`
+        + `showing patterns for ${fmtDate(s.used_open_time)}Z — the CNN embedding parquet has no entry yet for ${fmtDate(preferredIso)}Z. `
+        + `Run <code>python scripts/refresh_all.py</code> (no <code>--skip-cnn</code>) to bring the top-K up to today.`
+        + `</div>`);
     }
+  } catch (e) {
+    dom.similarGrid.classList.add('empty');
+    dom.similarGrid.innerHTML =
+      'no similar-pattern lookup available: ' + e.message;
   }
-  dom.similarGrid.classList.add('empty');
-  dom.similarGrid.innerHTML =
-    'no similar-pattern lookup available — CNN embeddings are missing '
-    + 'for recent bars. Run <code>python scripts/refresh_all.py</code> '
-    + '(without <code>--skip-cnn</code>) to regenerate them.';
 }
 
+// Grad-CAM only tries the requested bar. If it 404s we cache a "skip"
+// flag until the next fresh currentBarTime, so we don't hammer the
+// backend on the 15 s auto-refresh.
+let gradcamSkipUntil = null;
 async function refreshGradcamWithFallback(preferredIso) {
-  const bars = pickCandidateBars(preferredIso).concat(
-    state.candles.slice(-200, -8).map(c => c.open_time).reverse()
-  );
-  for (const ts of bars) {
-    try {
-      await loadGradcam(ts);
-      return;
-    } catch { /* try older */ }
+  if (gradcamSkipUntil === preferredIso) return;
+  try {
+    await loadGradcam(preferredIso);
+    gradcamSkipUntil = null;
+  } catch (e) {
+    gradcamSkipUntil = preferredIso;
+    dom.gradcam.innerHTML =
+      `<div class="empty">grad-cam unavailable for this bar: ${e.message}</div>`;
   }
 }
 
@@ -646,9 +784,26 @@ function scheduleLiveReconnect() {
 // ---------------------------------------------------------------------
 // Paper-trader controls
 // ---------------------------------------------------------------------
+function currentBackfill() {
+  const el = document.getElementById('backfill-input');
+  const v = el ? parseInt(el.value, 10) : 0;
+  return Number.isFinite(v) && v >= 0 ? v : 0;
+}
+
 dom.paperStart.addEventListener('click', async () => {
-  try { await postJson('/api/paper/start'); refreshPaper(); }
-  catch (e) { dom.paperStatus.textContent = `start failed: ${e.message}`; }
+  const n = currentBackfill();
+  dom.paperStart.disabled = true;
+  dom.paperStatus.textContent = n > 0
+    ? `backfilling ${n} historical bars…`
+    : `starting…`;
+  try {
+    await postJson('/api/paper/start', { backfill_bars: n });
+    refreshPaper();
+  } catch (e) {
+    dom.paperStatus.textContent = `start failed: ${e.message}`;
+  } finally {
+    dom.paperStart.disabled = false;
+  }
 });
 dom.paperStop.addEventListener('click', async () => {
   try { await postJson('/api/paper/stop'); refreshPaper(); }
@@ -659,6 +814,108 @@ dom.paperReset.addEventListener('click', async () => {
   catch (e) { dom.paperStatus.textContent = `reset failed: ${e.message}`; }
 });
 dom.reload.addEventListener('click', () => loadCandlesAndRegimes());
+
+// ---------------------------------------------------------------------
+// "Analyze visible range" — takes the current chart view, hits
+// /api/analyze/range, renders a rich per-window breakdown.
+// ---------------------------------------------------------------------
+document.getElementById('analyze-btn').addEventListener('click', analyzeVisible);
+
+async function analyzeVisible() {
+  const btn = document.getElementById('analyze-btn');
+  btn.disabled = true; btn.textContent = 'Analyzing…';
+  const panel = document.getElementById('analyze-panel');
+  const body  = document.getElementById('analyze-body');
+  const label = document.getElementById('analyze-range');
+  panel.hidden = false;
+  body.innerHTML = '<div class="empty">computing…</div>';
+
+  try {
+    const range = state.chart.timeScale().getVisibleRange();
+    if (!range || !range.from || !range.to) throw new Error('no visible range');
+    const start = secToIso(range.from);
+    const end   = secToIso(range.to);
+    const a = await API('/api/analyze/range', { start, end });
+    label.textContent = `${fmtDate(a.start)}Z → ${fmtDate(a.end)}Z · ${a.bars} bars`;
+    renderAnalysis(a);
+  } catch (e) {
+    body.innerHTML = `<div class="empty">analysis failed: ${e.message}</div>`;
+  } finally {
+    btn.disabled = false; btn.textContent = '🔬 Analyze visible range';
+  }
+}
+
+function renderAnalysis(a) {
+  const body = document.getElementById('analyze-body');
+  const rh = a.regime_histogram || {};
+  const total = (rh.bear + rh.sideways + rh.bull + rh.unknown) || 1;
+  const seg = (k) => (100 * (rh[k] || 0) / total).toFixed(1);
+  const ret = a.ohlc.return_pct;
+  const retCls = ret > 0 ? 'pos' : (ret < 0 ? 'neg' : 'mut');
+  const news = a.news || { count: 0 };
+  const preds = a.predictions || {};
+  const acc = preds.overall_accuracy;
+  const accCls = acc == null ? 'mut' : (acc > 0.52 ? 'pos' : (acc < 0.48 ? 'neg' : 'mut'));
+
+  const hist = preds.p_up_histogram || [];
+  const maxH = Math.max(1, ...hist);
+  const bins = hist.length || 1;
+  const histBars = hist.map((v, i) => {
+    const x = (100 / bins) * i, w = 100 / bins - 1;
+    const h = (v / maxH) * 60;
+    return `<rect class="hist-bar" x="${x}" y="${70 - h}" width="${w}" height="${h}"/>`;
+  }).join('');
+  const half = 50;
+  const halfLine = `<line x1="${half}" y1="0" x2="${half}" y2="70" stroke="var(--fg-muted)" stroke-width="0.5" stroke-dasharray="2 2"/>`;
+
+  const priceLine = `${fmtUsd(a.ohlc.first_close)} → ${fmtUsd(a.ohlc.last_close)}`;
+
+  body.innerHTML = `
+    <div class="stat ${retCls}">
+      <div class="lbl">Return</div>
+      <div class="val">${(ret * 100).toFixed(2)}%</div>
+      <div class="sub">${priceLine}</div>
+    </div>
+
+    <div class="stat">
+      <div class="lbl">Regime mix</div>
+      <div class="regime-bar" title="bear ${seg('bear')}% · sideways ${seg('sideways')}% · bull ${seg('bull')}% · unknown ${seg('unknown')}%">
+        <div class="bear"      style="width:${seg('bear')}%"></div>
+        <div class="sideways"  style="width:${seg('sideways')}%"></div>
+        <div class="bull"      style="width:${seg('bull')}%"></div>
+        <div class="unknown"   style="width:${seg('unknown')}%"></div>
+      </div>
+      <div class="sub">bear ${seg('bear')}% · side ${seg('sideways')}% · bull ${seg('bull')}%</div>
+    </div>
+
+    <div class="stat ${accCls}">
+      <div class="lbl">Accuracy in range</div>
+      <div class="val">${fmtPct(acc, 1)}</div>
+      <div class="sub">${preds.n || 0} preds · ${preds.n_traded || 0} traded · ${preds.n_abstained || 0} abstained</div>
+    </div>
+
+    <div class="stat">
+      <div class="lbl">P(up) distribution</div>
+      <svg viewBox="0 0 100 70" preserveAspectRatio="none">${halfLine}${histBars}</svg>
+      <div class="sub">bin width ${(1/bins).toFixed(3)}</div>
+    </div>
+
+    <div class="stat" style="grid-column: span 4;">
+      <div class="lbl">Top news in range · ${news.count} articles · mean sent ${news.mean == null ? '—' : news.mean.toFixed(2)}</div>
+      <div class="news-mini">
+        ${(news.top || []).map(n => `
+          <div class="row">
+            <time>${fmtDate(n.published_at)}Z</time>
+            <div>
+              <span class="src" style="color:var(--fg-muted);margin-right:4px;">${n.source}</span>
+              <a href="${n.url}" target="_blank" rel="noopener" style="color:var(--fg);text-decoration:none;">${escapeHtml(n.title)}</a>
+              <span class="sent ${n.sent_score > 0.15 ? 'pos' : (n.sent_score < -0.15 ? 'neg' : 'neu')}" style="margin-left:6px;font-size:10px;">${n.sent_score == null ? '—' : (n.sent_score >= 0 ? '+' : '') + n.sent_score.toFixed(2)}</span>
+            </div>
+          </div>`).join('') || '<div class="empty">no news in range</div>'}
+      </div>
+    </div>
+  `;
+}
 dom.regimeToggle.addEventListener('change', () => {
   if (state.currentBarTime) loadSimilarDetailed(state.currentBarTime).catch(() => {});
 });
@@ -668,7 +925,10 @@ async function maybeAutoStart() {
   state.autoStartAttempted = true;
   try {
     const s = await API('/api/paper/state');
-    if (!s.is_running) await postJson('/api/paper/start');
+    if (!s.is_running) {
+      // Auto-start with the backfill amount the user has set (default 500).
+      await postJson('/api/paper/start', { backfill_bars: currentBackfill() });
+    }
   } catch (e) {
     // best-effort; user can still click Start manually
     console.warn('auto-start skipped:', e && e.message);
@@ -684,9 +944,69 @@ async function boot() {
   await loadCandlesAndRegimes();
 }
 
+// ---------------------------------------------------------------------
+// Auto-retrain widget
+// ---------------------------------------------------------------------
+function fmtDuration(sec) {
+  if (!Number.isFinite(sec) || sec == null) return '—';
+  if (sec < 60) return `${Math.round(sec)}s`;
+  if (sec < 3600) return `${Math.round(sec / 60)}m`;
+  return `${(sec / 3600).toFixed(1)}h`;
+}
+
+async function refreshRetrain() {
+  try {
+    const r = await API('/api/retrain/status');
+    renderRetrain(r);
+  } catch (e) {
+    dom.retrainStatus.textContent = `unavailable`;
+  }
+}
+
+function renderRetrain(r) {
+  const label = r.is_running_refit
+    ? 'refit running…'
+    : (r.last_run_at ? `last refit ${fmtDate(r.last_run_at)}Z` : 'not yet run');
+  dom.retrainStatus.textContent = label;
+
+  const last = r.last_result || {};
+  const timings = last.timings_seconds || {};
+  const okCls = last.ok === false ? 'neg' : (last.ok === true ? 'pos' : '');
+  const rows = [
+    ['Auto interval', fmtDuration(r.interval_seconds)],
+    ['Next auto-refit in', fmtDuration(r.seconds_to_next_auto_refit)],
+    ['Last HMM refit', timings.hmm_s != null ? `${timings.hmm_s}s` : '—'],
+    ['Last FAISS rebuild', timings.faiss_s != null ? `${timings.faiss_s}s` : '—'],
+    ['Last fusion refit', timings.reload_and_fusion_s != null ? `${timings.reload_and_fusion_s}s` : '—'],
+    ['Bars on disk', last.total_bars_now ? last.total_bars_now.toLocaleString() : '—'],
+  ];
+  dom.retrainSummary.classList.remove('empty');
+  dom.retrainSummary.innerHTML = rows.map(([k, v]) =>
+    `<div class="k">${k}</div><div class="v ${okCls}">${v}</div>`
+  ).join('');
+}
+
+dom.retrainBtn.addEventListener('click', async () => {
+  dom.retrainBtn.disabled = true;
+  dom.retrainBtn.textContent = 'Refitting…';
+  try {
+    const r = await postJson('/api/retrain/trigger');
+    if (!r.ok) {
+      dom.retrainStatus.textContent = `errors: ${(r.errors || []).join('; ') || 'see logs'}`;
+    }
+    await refreshRetrain();
+  } catch (e) {
+    dom.retrainStatus.textContent = `refit failed: ${e.message}`;
+  } finally {
+    dom.retrainBtn.disabled = false;
+    dom.retrainBtn.textContent = 'Refit now';
+  }
+});
+
 // Periodic refreshes
 setInterval(refreshPaper, 2000);
 setInterval(refreshNews, 30_000);
+setInterval(refreshRetrain, 15_000);
 setInterval(() => {
   if (state.currentBarTime) refreshPredictionAndSimilar(state.currentBarTime);
 }, 15_000);
@@ -695,6 +1015,7 @@ boot()
   .then(() => {
     refreshPaper();
     refreshNews();
+    refreshRetrain();
     startLiveChartFeed();
     maybeAutoStart();
   })

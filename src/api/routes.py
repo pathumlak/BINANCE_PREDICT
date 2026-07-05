@@ -166,21 +166,44 @@ def similar_detailed(
     open_time: str,
     k: int = Query(5, ge=1, le=20),
     regime_filter: bool = True,
+    fallback: bool = True,
 ) -> dict:
     """Similar matches enriched with their 64-bar OHLC windows.
 
-    The frontend renders each match as a small candlestick sparkline so
-    the viewer can see the actual historical pattern that the CNN
-    considered similar.
+    When ``fallback=true`` (the default), a KeyError on the requested
+    bar (e.g. no CNN embedding yet for the live hour) automatically
+    re-runs against the newest bar that *does* have both an embedding
+    and a regime label. The response carries ``used_open_time`` so the
+    frontend can note the substitution without a second round trip.
     """
     svc = _svc(req)
-    ts = _parse_ts(open_time)
+    requested_ts = _parse_ts(open_time)
+    used_ts = requested_ts
+    fallback_reason: Optional[str] = None
+
     try:
-        rows = svc.similar_with_windows(ts, k=k, regime_filter=regime_filter)
+        rows = svc.similar_with_windows(requested_ts, k=k, regime_filter=regime_filter)
     except KeyError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+        if not fallback:
+            raise HTTPException(status_code=404, detail=str(e))
+        anchor = svc.latest_embedded_bar()
+        if anchor is None:
+            raise HTTPException(
+                status_code=503,
+                detail="no embedded bars on disk yet — extract CNN embeddings first",
+            )
+        used_ts = anchor
+        fallback_reason = str(e)
+        try:
+            rows = svc.similar_with_windows(anchor, k=k, regime_filter=regime_filter)
+        except KeyError as e2:
+            raise HTTPException(status_code=404, detail=str(e2))
+
     return {
-        "query_open_time": _iso(ts),
+        "query_open_time": _iso(requested_ts),
+        "used_open_time": _iso(used_ts),
+        "fallback_used": used_ts != requested_ts,
+        "fallback_reason": fallback_reason,
         "k": k,
         "regime_filter": regime_filter,
         "matches": [
@@ -196,6 +219,29 @@ def similar_detailed(
             for m in rows
         ],
     }
+
+
+@router.get("/analyze/range")
+def analyze_range(req: Request, start: str, end: str) -> dict:
+    """Rich per-window breakdown for the 'Analyze visible range' tool."""
+    svc = _svc(req)
+    a = _parse_ts(start)
+    b = _parse_ts(end)
+    orch = getattr(req.app.state, "orchestrator", None)
+    preds: list[dict] = []
+    if orch is not None:
+        # Reuse the same dict shape /api/paper/predictions returns so
+        # analyze_range can filter server-side.
+        for p in orch.state.predictions:
+            preds.append({
+                "open_time": p.open_time.isoformat(),
+                "p_up": p.p_up,
+                "cp_singleton": p.cp_singleton,
+                "correct": p.correct,
+                "predicted_direction": p.predicted_direction,
+                "actual_direction": p.actual_direction,
+            })
+    return svc.analyze_range(a, b, paper_predictions=preds)
 
 
 @router.get("/news")
@@ -244,10 +290,18 @@ def paper_state(req: Request) -> dict:
 
 
 @router.post("/paper/start")
-async def paper_start(req: Request) -> dict:
+async def paper_start(req: Request, backfill_bars: int = 0) -> dict:
+    """Start the paper trader. ``backfill_bars`` > 0 replays that many
+    historical closed candles through the state machine before going
+    live, so the accuracy card + trade log populate immediately."""
     orch = _orch(req)
-    await orch.start()
-    return {"is_running": orch.is_running, "balance": orch.state.balance}
+    await orch.start(backfill_bars=backfill_bars)
+    return {
+        "is_running": orch.is_running,
+        "balance": orch.state.balance,
+        "bars_seen": orch.state.bars_seen,
+        "closed_trades": len(orch.state.closed_trades),
+    }
 
 
 @router.post("/paper/stop")
@@ -284,6 +338,30 @@ def paper_predictions(req: Request, limit: int = Query(200, ge=1, le=2000)) -> d
             "correct": p.correct,
         })
     return {"count": len(rows), "predictions": rows}
+
+
+# ---------------------------------------------------------------------------
+# Auto-retrain — self-sustaining pipeline.
+# ---------------------------------------------------------------------------
+def _retrainer(req: Request):
+    r = getattr(req.app.state, "retrainer", None)
+    if r is None:
+        raise HTTPException(status_code=503, detail="retrainer not ready")
+    return r
+
+
+@router.get("/retrain/status")
+def retrain_status(req: Request) -> dict:
+    """Show scheduler state, last-run summary, and time until next auto-refit."""
+    return _retrainer(req).status()
+
+
+@router.post("/retrain/trigger")
+async def retrain_trigger(req: Request) -> dict:
+    """Force an immediate HMM + FAISS + fusion refit (a manual "Refit now" button)."""
+    r = _retrainer(req)
+    result = await r.trigger_now()
+    return result
 
 
 # ---------------------------------------------------------------------------

@@ -30,6 +30,7 @@ from src.live.paper_trader import (
     step as paper_step,
     validity_stats,
 )
+from src.live.persistence import LivePersistor
 from src.live.stream import CandleStream, MulticastCandleStream
 
 
@@ -44,7 +45,8 @@ class LiveOrchestrator:
 
     def __init__(self, inference: InferenceService,
                  initial_balance: float = 100.0,
-                 multicast: Optional[MulticastCandleStream] = None) -> None:
+                 multicast: Optional[MulticastCandleStream] = None,
+                 persist: bool = True) -> None:
         self.inference = inference
         self.state = PaperTraderState(initial_balance=initial_balance,
                                       balance=initial_balance)
@@ -52,6 +54,10 @@ class LiveOrchestrator:
         self.multicast = multicast
         self._queue: Optional[asyncio.Queue] = None
         self._task: Optional[asyncio.Task] = None
+        self.persistor: Optional[LivePersistor] = (
+            LivePersistor(pair=inference.pair, interval=inference.interval)
+            if persist else None
+        )
 
     # ------------------------------------------------------------------
     @property
@@ -59,10 +65,23 @@ class LiveOrchestrator:
         return self._task is not None and not self._task.done()
 
     # ------------------------------------------------------------------
-    async def start(self) -> None:
+    async def start(self, backfill_bars: int = 0) -> None:
+        """Start the trader.
+
+        ``backfill_bars`` — if > 0, replay that many of the most-recent
+        historical closed candles through the state machine BEFORE
+        going live. This makes the demo instantly useful: the paper
+        trader shows a populated balance, trades history, and accuracy
+        card without waiting up to an hour for the first live close.
+        """
         if self.is_running:
             logger.info("[orchestrator] already running")
             return
+
+        # Backfill first — synchronous but yield-friendly.
+        if backfill_bars > 0:
+            await self._backfill(backfill_bars)
+
         if self.multicast is not None:
             self._queue = self.multicast.subscribe()
         else:
@@ -74,7 +93,57 @@ class LiveOrchestrator:
         self.state.is_running = True
         self.state.started_at = pd.Timestamp.utcnow()
         self._task = asyncio.create_task(self._run())
-        logger.success("[orchestrator] started")
+        logger.success(f"[orchestrator] started (backfilled {backfill_bars} bars)")
+
+    async def _backfill(self, n_bars: int) -> None:
+        """Replay the last ``n_bars`` closed candles through the trader.
+
+        We use the InferenceService's in-memory OHLCV cache (which
+        already includes any live bars persisted before shutdown), so
+        no disk IO here.
+        """
+        ohlcv = self.inference._ohlcv
+        if ohlcv.empty:
+            return
+        n = min(int(n_bars), len(ohlcv))
+        tail = ohlcv.iloc[-n:]
+        logger.info(f"[orchestrator] backfilling {n} bars through paper trader…")
+        # Reset trader state so backfilling is idempotent.
+        self.state.reset(initial_balance=self.state.initial_balance)
+
+        cols = tail.columns
+        for ts, row in tail.iterrows():
+            candle = {
+                "open_time": ts,
+                "open":   float(row["open"]),
+                "high":   float(row["high"]),
+                "low":    float(row["low"]),
+                "close":  float(row["close"]),
+                "volume": float(row["volume"]),
+                "close_time": (pd.Timestamp(row["close_time"])
+                               if "close_time" in cols
+                               and pd.notna(row["close_time"])
+                               else ts + pd.Timedelta(minutes=59, seconds=59)),
+                "quote_volume": float(row.get("quote_volume", 0.0))
+                                if "quote_volume" in cols else 0.0,
+                "trades": int(row.get("trades", 0)) if "trades" in cols else 0,
+                "taker_buy_base": float(row.get("taker_buy_base",
+                                                float(row["volume"]) * 0.5))
+                                  if "taker_buy_base" in cols
+                                  else float(row["volume"]) * 0.5,
+                "taker_buy_quote": float(row.get("taker_buy_quote", 0.0))
+                                   if "taker_buy_quote" in cols else 0.0,
+                "is_closed": True,
+            }
+            try:
+                self._process_candle(candle)
+            except Exception as e:                                # noqa: BLE001
+                logger.error(f"[orchestrator] backfill failed at {ts}: {e}")
+            await asyncio.sleep(0)                                 # yield to loop
+        logger.success(
+            f"[orchestrator] backfill done — balance=${self.state.balance:.2f} "
+            f"trades={len(self.state.closed_trades)}"
+        )
 
     async def stop(self) -> None:
         self.state.is_running = False
@@ -128,6 +197,17 @@ class LiveOrchestrator:
         except Exception as e:                                      # noqa: BLE001
             logger.error(f"[orchestrator] inference failed at {ts}: {e}")
             return
+
+        # Persist to disk: candle to data/ohlcv, embedding to
+        # experiments/embeddings.  Buffered internally, so this is cheap.
+        if self.persistor is not None:
+            try:
+                self.persistor.enqueue_candle(candle)
+                emb = self.inference.latest_embedding_for(ts)
+                if emb is not None:
+                    self.persistor.enqueue_embedding(ts, emb)
+            except Exception as e:                                  # noqa: BLE001
+                logger.exception(f"[orchestrator] persist failed at {ts}: {e}")
 
         decision = paper_step(self.state, candle, prediction)
         d = decision["decision"]
@@ -217,4 +297,6 @@ class LiveOrchestrator:
                 for t, b in eq
             ],
             "stream": stream_status,
+            "persistence": (self.persistor.status()
+                            if self.persistor is not None else None),
         }

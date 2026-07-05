@@ -786,6 +786,51 @@ python scripts/run_dashboard.py --reload --port 8001
 * No authentication, no rate-limiting, no DB. This is a research
   artefact, not a SaaS.
 
+# Phase 9 — Self-sustaining pipeline
+
+Phase 9 removes the need for periodic `scripts/refresh_all.py` runs. As
+the dashboard runs, live bars are persisted to disk in the same
+canonical Parquet layout the historical loader produces, and the fast
+models (HMM regimes, FAISS index, anchor fusion) auto-refit on a
+schedule so predictions stay honest without any human intervention.
+
+## What's new
+
+* **`src/live/persistence.py`** — every closed candle from the
+  WebSocket stream is buffered and written to
+  `data/ohlcv/BTCUSDT/1h/YYYY-MM.parquet` (same schema as
+  `fetch_historical.py` produces). Each newly-computed CNN embedding is
+  appended to `experiments/embeddings/BTCUSDT/1h/candle/embeddings.parquet`.
+* **`src/live/retrainer.py`** — `RetrainerScheduler` runs every 24 hours
+  by default. Each pass calls the same `scripts/fit_hmm_regimes.py` +
+  `scripts/build_faiss_index.py` your manual driver runs, then reloads
+  the freshened artefacts and refits the anchor fusion model *in
+  place* — the dashboard never restarts, and clients see fresh models
+  the moment the refit finishes.
+* **`/api/retrain/status` + `/api/retrain/trigger`** — the frontend
+  shows a small "Self-sustaining pipeline" card with a **Refit now**
+  button for on-demand refits.
+* **Chart-CNN retrain is deliberately NOT auto-scheduled.** It takes
+  15–25 minutes on CPU and would freeze both the paper trader and the
+  UI. Trigger it by hand when convenient:
+
+  ```bash
+  python scripts/refresh_all.py         # includes the full CNN retrain
+  ```
+
+## How it changes your workflow
+
+Before Phase 9: run `scripts/refresh_all.py` daily / weekly to catch
+new bars, otherwise the model has stale features and the top-K
+similarity is meaningless on recent bars.
+
+After Phase 9: **just leave `python scripts/run_dashboard.py`
+running**. Every hour, a new BTC bar arrives, gets persisted, and
+feeds into the paper trader. Every 24 hours, the fast models refit.
+The only manual step left is the occasional full CNN retrain — and
+only if you want the top-K pattern-matching to include very-recent
+bars in its index.
+
 # Phase 8 — Live paper trading
 
 Phase 8 extends the dashboard with a **live walk-forward demo**: the

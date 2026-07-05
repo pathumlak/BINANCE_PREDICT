@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import io
 import logging
+import sys
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -452,6 +453,25 @@ class InferenceService:
     # ------------------------------------------------------------------
     # V2 — similar-match OHLCV windows (for mini charts)
     # ------------------------------------------------------------------
+    def latest_embedded_bar(self) -> Optional[pd.Timestamp]:
+        """Newest bar that has both a CNN embedding AND a regime label.
+
+        Used as an auto-fallback query for the top-K similarity strip
+        when the current live bar has no embedding yet (because the CNN
+        wasn't rerun after the last OHLCV backfill).
+        """
+        if self._embeddings is None or self._embeddings.empty:
+            return None
+        emb_idx = self._embeddings.index
+        # Intersect with regimes so PatternEngine.topk doesn't itself
+        # 404 on missing regime.
+        if self._regimes is not None and not self._regimes.empty:
+            common = emb_idx.intersection(self._regimes.index)
+            if len(common) == 0:
+                return None
+            return pd.Timestamp(common.max())
+        return pd.Timestamp(emb_idx.max())
+
     def similar_with_windows(self, open_time: pd.Timestamp, k: int = 5,
                              regime_filter: bool = True,
                              window: int = 64) -> list[dict]:
@@ -624,6 +644,235 @@ class InferenceService:
         closes = self._ohlcv["close"].iloc[idx - lookback:idx + 1].to_numpy(dtype=np.float64)
         rets = np.log(closes[1:] / closes[:-1])
         return float(np.std(rets, ddof=0))
+
+    # ------------------------------------------------------------------
+    # V2 — range analysis (for the "Analyze visible range" tool)
+    # ------------------------------------------------------------------
+    def analyze_range(self, start: pd.Timestamp, end: pd.Timestamp,
+                      paper_predictions: Optional[list] = None,
+                      n_hist_bins: int = 12) -> dict:
+        """Rich summary of everything the app knows about ``[start, end]``.
+
+        Returns a dict shaped for :func:`api.routes.analyze_range` to
+        serialise directly to JSON.
+        """
+        if end < start:
+            start, end = end, start
+
+        ohlc = self._ohlcv.loc[start:end]
+        n_bars = len(ohlc)
+
+        # --- OHLC summary --------------------------------------------
+        if n_bars > 0:
+            first_close = float(ohlc["close"].iloc[0])
+            last_close  = float(ohlc["close"].iloc[-1])
+            high = float(ohlc["high"].max())
+            low  = float(ohlc["low"].min())
+            ret_pct = (last_close - first_close) / first_close if first_close else 0.0
+            log_returns = np.log(ohlc["close"].to_numpy(dtype=np.float64) /
+                                 np.roll(ohlc["close"].to_numpy(dtype=np.float64), 1))
+            log_returns = log_returns[1:] if len(log_returns) > 1 else log_returns
+            realised_vol = float(np.std(log_returns, ddof=0)) if len(log_returns) else 0.0
+        else:
+            first_close = last_close = high = low = ret_pct = realised_vol = 0.0
+
+        # --- Regime histogram ---------------------------------------
+        regime_hist = {"bear": 0, "sideways": 0, "bull": 0, "unknown": 0}
+        if self._regimes is not None and not self._regimes.empty:
+            sub = self._regimes.loc[start:end]
+            for rid, cnt in sub["regime"].value_counts().items():
+                name = REGIME_LABELS.get(int(rid), "unknown")
+                regime_hist[name] = regime_hist.get(name, 0) + int(cnt)
+            missing = max(0, n_bars - int(sub.shape[0]))
+            regime_hist["unknown"] += missing
+        else:
+            regime_hist["unknown"] = n_bars
+
+        # --- News in range ------------------------------------------
+        news_items: list[dict] = []
+        news_agg = {"count": 0, "mean": None, "max": None, "min": None}
+        if self._news is not None and not self._news.empty:
+            n = self._news
+            sub = n[(n["published_at"] >= start) & (n["published_at"] <= end)]
+            news_agg["count"] = int(len(sub))
+            scores = sub["sent_score"].dropna().astype(float)
+            if len(scores):
+                news_agg["mean"] = float(scores.mean())
+                news_agg["max"]  = float(scores.max())
+                news_agg["min"]  = float(scores.min())
+            # Top 5 most notable (largest |score|) for the panel.
+            if not sub.empty:
+                sub2 = sub.copy()
+                sub2["abs_score"] = sub2["sent_score"].abs()
+                sub2 = sub2.sort_values("abs_score", ascending=False).head(5)
+                for _, r in sub2.iterrows():
+                    tickers = r.get("tickers")
+                    if not isinstance(tickers, (list, tuple, np.ndarray)):
+                        tickers = []
+                    news_items.append({
+                        "published_at": pd.Timestamp(r["published_at"]).isoformat(),
+                        "source": str(r.get("source", "")),
+                        "title": str(r.get("title", "")),
+                        "url": str(r.get("url", "")),
+                        "tickers": list(tickers),
+                        "sent_score": (float(r["sent_score"])
+                                       if pd.notna(r.get("sent_score"))
+                                       else None),
+                    })
+
+        # --- Predictions in range (from paper log) ------------------
+        # `paper_predictions` is passed in from the route because it
+        # lives on the orchestrator, not the InferenceService.
+        p_up_hist = [0] * n_hist_bins
+        n_pred = n_correct = n_traded = n_abstained = 0
+        acc_confident = acc_uncertain = None
+        conf_correct = conf_total = unc_correct = unc_total = 0
+        if paper_predictions:
+            for p in paper_predictions:
+                ts_str = p.get("open_time")
+                if not ts_str:
+                    continue
+                ts = pd.Timestamp(ts_str)
+                if ts < start or ts > end:
+                    continue
+                n_pred += 1
+                p_up = p.get("p_up")
+                if isinstance(p_up, (int, float)) and 0.0 <= p_up <= 1.0:
+                    b = min(n_hist_bins - 1, int(p_up * n_hist_bins))
+                    p_up_hist[b] += 1
+                if p.get("cp_singleton"):
+                    n_traded += 1
+                else:
+                    n_abstained += 1
+                if p.get("correct") is True:
+                    n_correct += 1
+                    if p.get("cp_singleton"):
+                        conf_correct += 1
+                    else:
+                        unc_correct += 1
+                if p.get("correct") is not None:
+                    if p.get("cp_singleton"):
+                        conf_total += 1
+                    else:
+                        unc_total += 1
+            if conf_total:
+                acc_confident = conf_correct / conf_total
+            if unc_total:
+                acc_uncertain = unc_correct / unc_total
+
+        overall_acc = (n_correct / n_pred) if n_pred else None
+
+        return {
+            "start": pd.Timestamp(start).isoformat(),
+            "end":   pd.Timestamp(end).isoformat(),
+            "bars": n_bars,
+            "ohlc": {
+                "first_close": first_close,
+                "last_close":  last_close,
+                "high": high,
+                "low":  low,
+                "return_pct": ret_pct,
+                "realised_vol": realised_vol,
+            },
+            "regime_histogram": regime_hist,
+            "news": {
+                **news_agg,
+                "top": news_items,
+            },
+            "predictions": {
+                "n": n_pred,
+                "n_traded": n_traded,
+                "n_abstained": n_abstained,
+                "overall_accuracy": overall_acc,
+                "confident_accuracy": acc_confident,
+                "uncertain_accuracy": acc_uncertain,
+                "p_up_histogram": p_up_hist,
+                "p_up_bin_edges": [
+                    round(i / n_hist_bins, 3) for i in range(n_hist_bins + 1)
+                ],
+            },
+        }
+
+    # ------------------------------------------------------------------
+    def latest_embedding_for(self, open_time: pd.Timestamp) -> Optional[np.ndarray]:
+        """Return the 128-d CNN embedding cached for ``open_time`` in
+        this process, or None if the bar is missing / CNN unavailable.
+
+        Used by the LivePersistor to snapshot the embedding produced by
+        :meth:`append_live_bar` and write it to the embeddings parquet.
+        """
+        ts = pd.Timestamp(open_time)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        else:
+            ts = ts.tz_convert("UTC")
+        if self._embeddings is None or ts not in self._embeddings.index:
+            return None
+        cols = [c for c in self._embeddings.columns if c.startswith("e")]
+        return self._embeddings.loc[ts, cols].to_numpy(dtype=np.float32).copy()
+
+    # ------------------------------------------------------------------
+    def refit_fast_models(self) -> dict:
+        """Rebuild HMM / FAISS / fusion in place from current on-disk data.
+
+        Called by :class:`RetrainerScheduler` and by the manual "Refit now"
+        button. Returns a status dict with per-step timings so the UI can
+        show a summary.
+        """
+        import subprocess  # noqa: PLC0415
+        import time         # noqa: PLC0415
+
+        pair, interval = self.pair, self.interval
+        timings: dict[str, float] = {}
+        errors: list[str] = []
+
+        # Persist any in-memory bars to disk before refitting.
+        # (The LivePersistor's own flush is best-effort; the retrainer
+        # asks for one via the orchestrator.)
+
+        # HMM regimes.
+        t0 = time.time()
+        try:
+            subprocess.run(
+                [sys.executable, "scripts/fit_hmm_regimes.py",
+                 "--pairs", pair, "--interval", interval],
+                cwd=str(PROJECT_ROOT), check=True,
+            )
+        except Exception as e:                                # noqa: BLE001
+            errors.append(f"hmm: {e}")
+        timings["hmm_s"] = round(time.time() - t0, 2)
+
+        # FAISS index.
+        t0 = time.time()
+        try:
+            subprocess.run(
+                [sys.executable, "scripts/build_faiss_index.py",
+                 "--pairs", pair, "--interval", interval],
+                cwd=str(PROJECT_ROOT), check=True,
+            )
+        except Exception as e:                                # noqa: BLE001
+            errors.append(f"faiss: {e}")
+        timings["faiss_s"] = round(time.time() - t0, 2)
+
+        # Reload the freshened artefacts + refit fusion.
+        t0 = time.time()
+        try:
+            self._load_ohlcv()
+            self._load_features_and_labels()
+            self._load_embeddings()
+            self._load_regimes()
+            self._load_pattern_engine()
+            self._fit_anchor_fusion()
+        except Exception as e:                                # noqa: BLE001
+            errors.append(f"reload: {e}")
+        timings["reload_and_fusion_s"] = round(time.time() - t0, 2)
+
+        return {
+            "ok": not errors,
+            "errors": errors,
+            "timings_seconds": timings,
+            "total_bars_now": len(self._ohlcv),
+        }
 
     # ------------------------------------------------------------------
     @property

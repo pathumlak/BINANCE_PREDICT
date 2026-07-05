@@ -44,7 +44,10 @@
             </select>
           </label>
           <button id="reload-btn">Reload</button>
-          <span id="hint">chart auto-updates via live feed · click any candle to inspect</span>
+          <button id="mark-btn" class="alt">✎ Mark range</button>
+          <button id="analyze-btn" class="alt">🔬 Analyze visible range</button>
+          <button id="clear-mark-btn" class="alt" hidden>✕ Clear mark</button>
+          <span id="hint">click a candle to inspect · Mark range = click A then B for auto-analysis</span>
         </div>
         <div id="chart"></div>
         <div id="regime-strip"></div>
@@ -73,6 +76,13 @@
             <button id="paper-start-btn" class="primary">Start</button>
             <button id="paper-stop-btn" class="secondary">Stop</button>
             <button id="paper-reset-btn" class="secondary">Reset $100</button>
+            <label class="inline" style="margin-left:auto;">
+              backfill
+              <input type="number" id="backfill-input" value="500" min="0" max="10000" step="100"
+                     style="width:70px; background: var(--bg-card); color: var(--fg);
+                            border: 1px solid var(--border); border-radius: 4px; padding: 2px 4px;" />
+              bars
+            </label>
           </div>
           <div id="paper-status" class="empty">not started</div>
           <div id="paper-summary"></div>
@@ -82,16 +92,41 @@
       </aside>
     </section>
 
-    <!-- Row 3: model accuracy card -->
-    <section id="accuracy-panel" class="card">
+    <!-- Analysis panel (populated on demand) -->
+    <section id="analyze-panel" class="card" hidden>
       <div class="card-title">
-        <h2>Model accuracy — all closed bars</h2>
-        <span id="accuracy-count" class="freshness">0 labelled</span>
+        <h2>🔬 Range analysis</h2>
+        <span id="analyze-range" class="freshness">—</span>
       </div>
-      <div id="accuracy-body">
-        <div id="accuracy-summary" class="empty">no closed bars yet</div>
-        <svg id="accuracy-spark" viewBox="0 0 800 60" preserveAspectRatio="none"></svg>
-      </div>
+      <div id="analyze-body"></div>
+    </section>
+
+    <!-- Row 3: model accuracy + auto-retrain -->
+    <section id="accuracy-row">
+      <section id="accuracy-panel" class="card">
+        <div class="card-title">
+          <h2>Model accuracy — all closed bars</h2>
+          <span id="accuracy-count" class="freshness">0 labelled</span>
+        </div>
+        <div id="accuracy-body">
+          <div id="accuracy-summary" class="empty">no closed bars yet</div>
+          <svg id="accuracy-spark" viewBox="0 0 800 60" preserveAspectRatio="none"></svg>
+        </div>
+      </section>
+
+      <section id="retrain-panel" class="card">
+        <div class="card-title">
+          <h2>Self-sustaining pipeline</h2>
+          <span id="retrain-status" class="freshness">—</span>
+        </div>
+        <div id="retrain-body">
+          <div id="retrain-summary" class="empty">status pending…</div>
+          <div class="retrain-actions">
+            <button id="retrain-btn" class="primary">Refit now</button>
+            <span class="hint">HMM + FAISS + fusion · ~30 s.  CNN retrain needs <code>refresh_all.py</code>.</span>
+          </div>
+        </div>
+      </section>
     </section>
 
     <!-- Row 4: news feed + grad-cam -->
